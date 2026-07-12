@@ -34,7 +34,7 @@
 // Loudness sensor (Particle kit, analog out) — interim trigger until the
 // XIAO listener board arrives. GPIO34 = A3, ADC1: input-only, no WiFi clash.
 #define MIC_PIN           34
-#define LOUD_PP_THRESHOLD 800  // CALIBRATION KNOB — 12-bit peak-to-peak; tune via serial
+#define LOUD_PP_THRESHOLD 250  // CALIBRATION KNOB — measured: quiet room pp=0, shout at 1 m pp≈260-670
 
 // Per-panel serpentine. CALIBRATION KNOBS — fixed against a real panel (see
 // panel_test): true flips X across every row, matching this panel's wiring.
