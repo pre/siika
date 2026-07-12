@@ -1,0 +1,3 @@
+# WiFi credentials — real values live in secrets.h, never committed.
+# Commit secrets.h.example (placeholders) instead.
+firmware/siika/secrets.h
