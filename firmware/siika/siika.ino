@@ -290,17 +290,15 @@ void drawStatPage(char label, uint32_t val, bool known) {
   strip.show();
 }
 
-uint16_t idlePage = 0;
-void showNextIdlePage() {
+// Idle: sweep the four counters, STAT_MS each, so every number is readable. Shown
+// before every animation and doubles as the idle view when no siika is detected.
+const int STAT_MS = 2000;     // how long each counter stays up (tunable)
+void showCounterSweep() {
   bool known = timeKnown();
-  switch (idlePage) {
-    case 0: drawStatPage('H', lastHourCount(), known); break;  // last hour
-    case 1: drawStatPage('T', g_today,         known); break;  // today
-    case 2: drawStatPage('E', g_yest,          known); break;  // yesterday
-    case 3: drawStatPage('Y', g_total,         true ); break;  // total (always known)
-  }
-  idlePage = (idlePage + 1) % 4;
-  delay(1000);
+  drawStatPage('H', lastHourCount(), known); delay(STAT_MS);  // last hour
+  drawStatPage('T', g_today,         known); delay(STAT_MS);  // today
+  drawStatPage('E', g_yest,          known); delay(STAT_MS);  // yesterday
+  drawStatPage('Y', g_total,         true ); delay(STAT_MS);  // total (always known)
 }
 
 // ---- Detection animations (single-panel prototype content) ----
@@ -314,7 +312,7 @@ void animSiikaTriple() { blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 3, 1); }
 // 3. "OTA SIIKA POIS" one word at a time (whole-phrase blink needs the full wall).
 void animOtaSiikaPois() {
   const char* words[] = {"OTA", "SIIKA", "POIS"};
-  for (int cycle = 0; cycle < 5; cycle++)
+  for (int cycle = 0; cycle < 2; cycle++)     // two passes
     for (int w = 0; w < 3; w++) {
       strip.clear(); drawCentered(words[w], TEXT_COLOR, 1); strip.show(); delay(500);
     }
@@ -356,14 +354,11 @@ void playNextDetectionAnim() {
 }
 
 // ---- Trigger (single swap point) ----
-// ponytail: prototype = fires every 2 s. Replace the body with
+// ponytail: prototype = always true, so each 2 s counter sweep is followed by the
+// next animation (the 2 s pacing is the sweep itself). Replace the body with
 // digitalRead(TRIGGER_PIN) from the listener board (see voice-trigger.md) later —
 // this is the only line that changes.
-bool siikaDetected() {
-  static uint32_t last = 0;
-  if (millis() - last >= 2000) { last = millis(); return true; }
-  return false;
-}
+bool siikaDetected() { return true; }
 
 // ---- Self-check: the non-trivial counter logic, no NVS/time needed ----
 void selfTest() {
@@ -407,11 +402,10 @@ void setup() {
 }
 
 void loop() {
-  if (siikaDetected()) {
+  showCounterSweep();                 // idle: show the counter for 2 s
+  if (siikaDetected()) {              // real: mic trigger; placeholder: always true
     recordDetection(nowEpoch());
     playNextDetectionAnim();
     strip.clear(); strip.show();
-  } else {
-    showNextIdlePage();
   }
 }

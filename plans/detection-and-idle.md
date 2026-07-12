@@ -40,11 +40,10 @@ bool siikaDetected() {
 }
 
 void loop() {
-  if (siikaDetected()) {
+  showCounterSweep();            // idle: show the counter for 2 s (4 stats x 0.5 s)
+  if (siikaDetected()) {         // real: mic; placeholder: always true
     recordDetection(nowEpoch());
     playNextDetectionAnim();
-  } else {
-    showNextIdlePage();          // ~1 s per page, then returns to re-poll
   }
 }
 ```
@@ -109,9 +108,11 @@ part to order, unnecessary once WiFi is available).
 
 ## Idle stats display (prototype, 1 panel)
 
-16×16 can't show four labelled numbers legibly at once → **page through them**,
-~1 s each, looping: `H` (last hour) → `T` (today) → `E` (yesterday, "eilen") →
-`Y` (total, "yhteensä"). Each page = the label glyph small, the number centred.
+16×16 can't show four labelled numbers legibly at once → **sweep through them**,
+**2 s each** (`STAT_MS`, tunable) so each number is readable, shown before every
+animation and as the idle view: `H` (last hour) → `T` (today) → `E` (yesterday,
+"eilen") → `Y` (total, "yhteensä"). Each page = the label glyph small, the number
+centred.
 
 - **Font extension needed**: add digits `0-9` and label letters `H E Y` (`T`, `S`,
   `I`, `K`, `A`, `O`, `P`, space already exist). ~13 new 3-px glyphs.
@@ -132,7 +133,7 @@ tall) is the "big" size.
 1. **Fish swim** [proto] — fish crosses L→R and exits, then R→L and exits.
    `swim()` already exists; split it out as its own animation.
 2. **SIIKA ×3** [proto] — blink "SIIKA" 3× at 0.5 s (`blinkCentered("SIIKA", …, 3)`).
-3. **OTA SIIKA POIS** [proto] — one word at a time, 0.5 s each, cycled; the full
+3. **OTA SIIKA POIS** [proto] — one word at a time, 0.5 s each, two passes; the full
    phrase with a 0.5 s hold between first and last word is the **[wall]** variant
    once "OTA SIIKA POIS" fits across panels.
 4. **Size fill → big SIIKA** — [wall] fills the wall with "SIIKA" at mixed `scale`s,
