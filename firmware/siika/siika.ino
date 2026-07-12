@@ -4,8 +4,9 @@
 //   idle      -> cycle stat pages (last hour / today / yesterday / total)
 //   detected  -> record the catch, play the next detection animation, back to idle
 //
-// Trigger is one swap point (siikaDetected): a 2 s timer now, digitalRead of the
-// listener board's GPIO later. Counts persist in NVS across power loss. Wall-clock
+// Trigger is one swap point (siikaDetected): loudness sensor on GPIO34 now
+// (see plans/loudness-trigger.md), digitalRead of the listener board's GPIO
+// later. Counts persist in NVS across power loss. Wall-clock
 // time comes from NTP over WiFi (creds in secrets.h) so today/yesterday/hour are real.
 //
 // Board: WEMOS D1 R32 (esp32:esp32:d1_uno32), data GPIO16, 256 LEDs, GRB.
@@ -29,6 +30,11 @@
 
 #define DATA_PIN   16
 #define BRIGHTNESS 12          // USB-safe cap. Raise only on the MEAN WELL PSU.
+
+// Loudness sensor (Particle kit, analog out) — interim trigger until the
+// XIAO listener board arrives. GPIO34 = A3, ADC1: input-only, no WiFi clash.
+#define MIC_PIN           34
+#define LOUD_PP_THRESHOLD 800  // CALIBRATION KNOB — 12-bit peak-to-peak; tune via serial
 
 // Per-panel serpentine. CALIBRATION KNOBS — fixed against a real panel (see
 // panel_test): true flips X across every row, matching this panel's wiring.
@@ -295,10 +301,10 @@ void drawStatPage(char label, uint32_t val, bool known) {
 const int STAT_MS = 2000;     // how long each counter stays up (tunable)
 void showCounterSweep() {
   bool known = timeKnown();
-  drawStatPage('H', lastHourCount(), known); delay(STAT_MS);  // last hour
-  drawStatPage('T', g_today,         known); delay(STAT_MS);  // today
-  drawStatPage('E', g_yest,          known); delay(STAT_MS);  // yesterday
-  drawStatPage('Y', g_total,         true ); delay(STAT_MS);  // total (always known)
+  drawStatPage('H', lastHourCount(), known); listenDelay(STAT_MS);  // last hour
+  drawStatPage('T', g_today,         known); listenDelay(STAT_MS);  // today
+  drawStatPage('E', g_yest,          known); listenDelay(STAT_MS);  // yesterday
+  drawStatPage('Y', g_total,         true ); listenDelay(STAT_MS);  // total (always known)
 }
 
 // ---- Detection animations (single-panel prototype content) ----
@@ -354,11 +360,37 @@ void playNextDetectionAnim() {
 }
 
 // ---- Trigger (single swap point) ----
-// ponytail: prototype = always true, so each 2 s counter sweep is followed by the
-// next animation (the 2 s pacing is the sweep itself). Replace the body with
-// digitalRead(TRIGGER_PIN) from the listener board (see voice-trigger.md) later —
-// this is the only line that changes.
-bool siikaDetected() { return true; }
+// Loudness sensor: listenDelay() samples MIC_PIN while the counter sweep shows
+// and latches g_heard on a loud peak. Animations never listen -> natural cooldown.
+// ponytail: swap the latch for digitalRead(TRIGGER_PIN) when the listener
+// board arrives (see voice-trigger.md) — this stays the only swap point.
+bool g_heard = false;
+
+// delay(ms) that keeps the mic open: peak-to-peak over the window, early exit
+// on a hit so a clap reacts instantly (the guard skips the sweep's remaining
+// pages). Prints pp for threshold calibration.
+void listenDelay(uint32_t ms) {
+  if (g_heard) return;                  // already latched — fall through fast
+  uint32_t start = millis();
+  int lo = 4095, hi = 0;
+  while (millis() - start < ms) {
+    int v = analogRead(MIC_PIN);
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    if (hi - lo >= LOUD_PP_THRESHOLD) {
+      g_heard = true;
+      Serial.printf("mic TRIGGER pp=%d\n", hi - lo);
+      return;
+    }
+  }
+  Serial.printf("mic pp=%d\n", hi - lo);
+}
+
+bool siikaDetected() {
+  bool h = g_heard;
+  g_heard = false;
+  return h;
+}
 
 // ---- Self-check: the non-trivial counter logic, no NVS/time needed ----
 void selfTest() {
@@ -402,8 +434,8 @@ void setup() {
 }
 
 void loop() {
-  showCounterSweep();                 // idle: show the counter for 2 s
-  if (siikaDetected()) {              // real: mic trigger; placeholder: always true
+  showCounterSweep();                 // idle: counters up + mic listening
+  if (siikaDetected()) {              // loud sound latched during the sweep
     recordDetection(nowEpoch());
     playNextDetectionAnim();
     strip.clear(); strip.show();
