@@ -218,13 +218,10 @@ void setupTime() {
 }
 
 // ---- Persistent counter (NVS via Preferences) ----
-#define RECENT_N 64            // ring of recent catch timestamps for the 1h window
 Preferences prefs;
 uint32_t g_total = 0;
 int32_t  g_curDay = -1;        // -1 = no dated catch recorded yet
 uint16_t g_today = 0, g_yest = 0;
-uint32_t g_recent[RECENT_N];
-uint8_t  g_rhead = 0;
 
 void loadCounters() {
   prefs.begin("siika", false);
@@ -232,9 +229,6 @@ void loadCounters() {
   g_curDay = prefs.getInt   ("curDay", -1);
   g_today  = prefs.getUShort("today",  0);
   g_yest   = prefs.getUShort("yest",   0);
-  g_rhead  = prefs.getUChar ("rhead",  0);
-  memset(g_recent, 0, sizeof(g_recent));
-  prefs.getBytes("recent", g_recent, sizeof(g_recent));   // no-op if key absent
 }
 
 void saveCounters() {
@@ -242,8 +236,35 @@ void saveCounters() {
   prefs.putInt   ("curDay", g_curDay);
   prefs.putUShort("today",  g_today);
   prefs.putUShort("yest",   g_yest);
-  prefs.putUChar ("rhead",  g_rhead);
-  prefs.putBytes ("recent", g_recent, sizeof(g_recent));
+}
+
+// ---- Last-60-minutes rolling count: 60 one-minute buckets on uptime ----
+// H = sum of the buckets covering the last 60 minutes. Uptime-based (millis) so it
+// needs no wall clock — works before/without NTP, and it's a true rolling window,
+// uncapped (unlike the old 64-slot ring that pinned H at 64). Not persisted: millis
+// resets on reboot, and a >1 h outage legitimately zeroes the last hour anyway.
+// ponytail: millis wraps at ~49 days => H briefly disturbed for one hour then; fine
+// for a prototype, revisit only for a permanent install.
+uint16_t g_min[60];            // detections in each minute
+uint32_t g_minStamp[60];       // uptime-minute each bucket currently represents
+
+uint32_t uptimeMin() { return millis() / 60000UL; }
+
+// Pure window-sum, split out so selfTest() can exercise it with synthetic data.
+uint16_t sumLastHour(uint32_t m, const uint16_t* mins, const uint32_t* stamps) {
+  uint16_t c = 0;
+  for (int i = 0; i < 60; i++)
+    if (m - stamps[i] < 60) c += mins[i];   // bucket within the last 60 minutes
+  return c;
+}
+
+uint16_t lastHourCount() { return sumLastHour(uptimeMin(), g_min, g_minStamp); }
+
+void bumpLastHour() {
+  uint32_t m = uptimeMin();
+  uint8_t idx = m % 60;
+  if (g_minStamp[idx] != m) { g_min[idx] = 0; g_minStamp[idx] = m; }  // recycle stale bucket
+  g_min[idx]++;
 }
 
 // Pure day-rollover: on a new day shift today->yest; a gap of >1 day zeroes yest.
@@ -258,26 +279,14 @@ void rollDay(int32_t d, int32_t &curDay, uint16_t &today, uint16_t &yest) {
 
 void recordDetection(uint32_t t) {
   g_total++;
-  if (timeKnown()) {                       // else: count into total only (plan rule)
+  bumpLastHour();                          // H is uptime-based: counts with or without NTP
+  if (timeKnown()) {                       // today/yesterday need the wall clock
     rollDay(localDayIndex(t), g_curDay, g_today, g_yest);
     g_today++;
-    g_recent[g_rhead] = t;
-    g_rhead = (g_rhead + 1) % RECENT_N;
   }
   saveCounters();
   // ponytail: one NVS write per catch. Catches are minutes+ apart => nowhere near
   // NVS endurance. Add batching only if catches ever become high-frequency.
-}
-
-// Catches within the last hour. ponytail: saturates at RECENT_N (64/h) — plenty
-// for a fish panel. Upgrade path: 60 one-minute buckets instead of a ring.
-uint16_t lastHourCount() {
-  if (!timeKnown()) return 0;
-  uint32_t now = nowEpoch();
-  uint16_t c = 0;
-  for (int i = 0; i < RECENT_N; i++)
-    if (g_recent[i] && g_recent[i] + 3600 >= now) c++;
-  return c;
 }
 
 // ---- Idle stats display (single panel: label on top, number below) ----
@@ -301,7 +310,7 @@ void drawStatPage(char label, uint32_t val, bool known) {
 const int STAT_MS = 2000;     // how long each counter stays up (tunable)
 void showCounterSweep() {
   bool known = timeKnown();
-  drawStatPage('H', lastHourCount(), known); listenDelay(STAT_MS);  // last hour
+  drawStatPage('H', lastHourCount(), true);  listenDelay(STAT_MS);  // last hour (uptime-based, no clock needed)
   drawStatPage('T', g_today,         known); listenDelay(STAT_MS);  // today
   drawStatPage('E', g_yest,          known); listenDelay(STAT_MS);  // yesterday
   drawStatPage('Y', g_total,         true ); listenDelay(STAT_MS);  // total (always known)
@@ -403,9 +412,12 @@ void selfTest() {
   td = 5; rollDay(110, cur, td, ye);          // 9-day gap: yest -> 0
   assert(ye == 0 && td == 0 && cur == 110);
 
-  uint32_t now = 100000, r[4] = {now - 10, now - 3599, now - 3601, 0};
-  int c = 0; for (int i = 0; i < 4; i++) if (r[i] && r[i] + 3600 >= now) c++;
-  assert(c == 2);                             // window counts the two within 1h
+  // last-60-min buckets: sum only buckets within the last 60 uptime-minutes
+  uint16_t mins[60] = {0}; uint32_t stamps[60] = {0};
+  mins[0] = 5; stamps[0] = 100;               // this minute
+  mins[1] = 3; stamps[1] = 41;                // 59 min ago -> included
+  mins[2] = 7; stamps[2] = 40;                // 60 min ago -> excluded
+  assert(sumLastHour(100, mins, stamps) == 8);
 
   assert(daysFromCivil(1970, 1, 1) == 0);     // day-index anchor + consecutiveness
   assert(daysFromCivil(1970, 1, 2) == 1);
