@@ -33,7 +33,7 @@ Nykytila: prototyyppi VALMIS — yksi paneeli toimii USB-virralla
   `ls /dev/cu.* | grep -i usbserial`.
 - `arduino-cli`, board `esp32:esp32:d1_uno32`. Uploadissa PAKKO käyttää
   `UploadSpeed=460800` (oletus 921600 korruptoi CH340:llä). Monitor 115200 baud.
-- Adafruit NeoPixel -kirjasto (ei FastLED/PlatformIO), data GPIO16,
+- FastLED-kirjasto (≥3.9, ei PlatformIO), data GPIO16,
   serpentiini-XY-mappaus.
 - Firmware: `firmware/siika/siika.ino` = varsinainen ohjelma,
   `firmware/panel_test/panel_test.ino` = diagnostiikka, ei muuteta.
@@ -43,3 +43,8 @@ Nykytila: prototyyppi VALMIS — yksi paneeli toimii USB-virralla
 Suunnitellaan AINA ennen toteuttamista. Suunnitelma kirjoitetaan tiedostoon
 plans/ hakemistossa. Kysy aina lupa ennen kuin siirrytään suunnitelmasta
 toteutukseen.
+
+# Kieli
+
+Aina kun sinulle tulee mieleen "whitefish" kirjoita "siika" tai "SIIKA"
+kontekstista riippuen. Siika on termi, joka ei käänny englannin kielelle.

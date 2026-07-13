@@ -12,7 +12,7 @@
 // Board: WEMOS D1 R32 (esp32:esp32:d1_uno32), data GPIO16, 256 LEDs, GRB.
 // POWER: still USB — BRIGHTNESS stays capped low; animations never fill the canvas.
 
-#include <Adafruit_NeoPixel.h>
+#include <FastLED.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <time.h>
@@ -44,11 +44,11 @@
 // Helsinki time incl. DST — day/hour buckets need local, not UTC, day boundaries.
 #define TZ_HELSINKI "EET-2EEST,M3.5.0/3,M10.5.0/4"
 
-Adafruit_NeoPixel strip(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
+CRGB leds[NUM_LEDS];
 
-const uint32_t TEXT_COLOR  = Adafruit_NeoPixel::Color(160, 210, 220);  // cyan-white
-const uint32_t LABEL_COLOR = Adafruit_NeoPixel::Color(60, 90, 100);    // dim label
-const uint32_t FISH_COLOR  = Adafruit_NeoPixel::Color(230, 90, 0);     // warm orange
+const CRGB TEXT_COLOR  = CRGB(160, 210, 220);  // cyan-white
+const CRGB LABEL_COLOR = CRGB(60, 90, 100);    // dim label
+const CRGB FISH_COLOR  = CRGB(230, 90, 0);     // warm orange
 
 struct Glyph { char ch; uint8_t w; uint8_t rows[5]; };
 
@@ -70,9 +70,9 @@ uint16_t XY(int x, int y) {
   return panelIndex(px, py) * (PANEL_W * PANEL_H) + localIndex(lx, ly);
 }
 
-void setPx(int x, int y, uint32_t c) {          // bounds-checked write
+void setPx(int x, int y, CRGB c) {              // bounds-checked write
   if (x < 0 || x >= W || y < 0 || y >= H) return;
-  strip.setPixelColor(XY(x, y), c);
+  leds[XY(x, y)] = c;
 }
 
 // ---- Compact proportional font, 5px tall. MSB = leftmost column ----
@@ -127,7 +127,7 @@ int textWidth(const char* s, int scale) {
 }
 
 // Draw one glyph, each source pixel a scale x scale block.
-void drawChar(int x, int y, char ch, uint32_t c, int scale) {
+void drawChar(int x, int y, char ch, CRGB c, int scale) {
   const Glyph* g = glyphFor(ch);
   if (!g) return;
   for (int r = 0; r < FONT_H; r++)
@@ -138,22 +138,22 @@ void drawChar(int x, int y, char ch, uint32_t c, int scale) {
             setPx(x + col * scale + sx, y + r * scale + sy, c);
 }
 
-void drawText(int x, int y, const char* s, uint32_t c, int scale) {
+void drawText(int x, int y, const char* s, CRGB c, int scale) {
   for (int i = 0; s[i]; i++) {
     drawChar(x, y, s[i], c, scale);
     x += (charWidth(s[i]) + GAP) * scale;
   }
 }
 
-void drawCentered(const char* s, uint32_t c, int scale) {
+void drawCentered(const char* s, CRGB c, int scale) {
   drawText((W - textWidth(s, scale)) / 2, (H - FONT_H * scale) / 2, s, c, scale);
 }
 
 // Blink a centred string `times`, onMs lit / offMs dark, at the given scale.
-void blinkCentered(const char* s, uint32_t c, int onMs, int offMs, int times, int scale) {
+void blinkCentered(const char* s, CRGB c, int onMs, int offMs, int times, int scale) {
   for (int i = 0; i < times; i++) {
-    strip.clear(); drawCentered(s, c, scale); strip.show(); delay(onMs);
-    strip.clear();                            strip.show(); delay(offMs);
+    FastLED.clear(); drawCentered(s, c, scale); FastLED.show(); delay(onMs);
+    FastLED.clear();                            FastLED.show(); delay(offMs);
   }
 }
 
@@ -162,7 +162,7 @@ void blinkCentered(const char* s, uint32_t c, int onMs, int offMs, int times, in
 #define FISH_H 7
 const uint16_t FISH[FISH_H] = {30, 127, 375, 511, 383, 127, 30};
 
-void drawFish(int x, int y, uint32_t c, bool faceRight) {
+void drawFish(int x, int y, CRGB c, bool faceRight) {
   for (int r = 0; r < FISH_H; r++)
     for (int col = 0; col < FISH_W; col++)
       if ((FISH[r] >> (FISH_W - 1 - col)) & 1) {
@@ -171,12 +171,12 @@ void drawFish(int x, int y, uint32_t c, bool faceRight) {
       }
 }
 
-void swim(uint32_t c, bool faceRight, int stepMs) {
+void swim(CRGB c, bool faceRight, int stepMs) {
   int y = (H - FISH_H) / 2;
   if (faceRight)
-    for (int x = -FISH_W; x <= W; x++) { strip.clear(); drawFish(x, y, c, true);  strip.show(); delay(stepMs); }
+    for (int x = -FISH_W; x <= W; x++) { FastLED.clear(); drawFish(x, y, c, true);  FastLED.show(); delay(stepMs); }
   else
-    for (int x = W; x >= -FISH_W; x--) { strip.clear(); drawFish(x, y, c, false); strip.show(); delay(stepMs); }
+    for (int x = W; x >= -FISH_W; x--) { FastLED.clear(); drawFish(x, y, c, false); FastLED.show(); delay(stepMs); }
 }
 
 // ---- Time (NTP over WiFi) ----
@@ -296,13 +296,13 @@ void numToStr(uint32_t n, char* buf) {
 }
 
 void drawStatPage(char label, uint32_t val, bool known) {
-  strip.clear();
+  FastLED.clear();
   char lb[2] = {label, 0};
   drawText((W - textWidth(lb, 1)) / 2, 1, lb, LABEL_COLOR, 1);
   char nb[8];
   if (known) numToStr(val, nb); else strcpy(nb, "--");
   drawText((W - textWidth(nb, 1)) / 2, 9, nb, TEXT_COLOR, 1);
-  strip.show();
+  FastLED.show();
 }
 
 // Idle: sweep the four counters, STAT_MS each, so every number is readable. Shown
@@ -329,7 +329,7 @@ void animOtaSiikaPois() {
   const char* words[] = {"OTA", "SIIKA", "POIS"};
   for (int cycle = 0; cycle < 2; cycle++)     // two passes
     for (int w = 0; w < 3; w++) {
-      strip.clear(); drawCentered(words[w], TEXT_COLOR, 1); strip.show(); delay(500);
+      FastLED.clear(); drawCentered(words[w], TEXT_COLOR, 1); FastLED.show(); delay(500);
     }
 }
 
@@ -339,9 +339,9 @@ void animBigSiika() {
   const char* letters = "SIIKA";
   for (int i = 0; letters[i]; i++) {
     char one[2] = {letters[i], 0};
-    strip.clear();
+    FastLED.clear();
     drawText((W - textWidth(one, 2)) / 2, (H - FONT_H * 2) / 2, one, TEXT_COLOR, 2);
-    strip.show(); delay(300);
+    FastLED.show(); delay(300);
   }
   blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 5, 1);
 }
@@ -349,10 +349,10 @@ void animBigSiika() {
 // Milestone: every 10th catch gets a sparkle/rainbow burst instead of rotation.
 void animMilestone() {
   for (int f = 0; f < 60; f++) {
-    strip.clear();
+    FastLED.clear();
     for (int i = 0; i < 12; i++)                         // 12 lit px: USB-safe
-      setPx(random(W), random(H), Adafruit_NeoPixel::ColorHSV(random(65536)));
-    strip.show(); delay(30);
+      setPx(random(W), random(H), CHSV(random(256), 255, 255));
+    FastLED.show(); delay(30);
   }
 }
 
@@ -429,10 +429,11 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println(F("\nSiikapaneeli — detection show + idle stats, GPIO16, single panel"));
-  strip.begin();
-  strip.setBrightness(BRIGHTNESS);
-  strip.clear();
-  strip.show();
+  FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, 400);  // hard USB cap, safety net
+  FastLED.clear();
+  FastLED.show();
 
   selfTest();
   randomSeed(micros());
@@ -450,6 +451,6 @@ void loop() {
   if (siikaDetected()) {              // loud sound latched during the sweep
     recordDetection(nowEpoch());
     playNextDetectionAnim();
-    strip.clear(); strip.show();
+    FastLED.clear(); FastLED.show();
   }
 }
