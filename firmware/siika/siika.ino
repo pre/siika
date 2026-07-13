@@ -4,9 +4,11 @@
 //   idle      -> cycle stat pages (last hour / today / yesterday / total)
 //   detected  -> record the catch, play the next detection animation, back to idle
 //
-// Trigger is one swap point (siikaDetected): loudness sensor on GPIO34 now
+// Trigger is one swap point (takeDetection): loudness sensor on GPIO34 now
 // (see plans/loudness-trigger.md), digitalRead of the listener board's GPIO
-// later. Counts persist in NVS across power loss. Wall-clock
+// later. The mic stays open during animations: every detection queues one
+// more replay and one more count (see plans/detection-and-idle.md).
+// Counts persist in NVS across power loss. Wall-clock
 // time comes from NTP over WiFi (creds in secrets.h) so today/yesterday/hour are real.
 //
 // Board: WEMOS D1 R32 (esp32:esp32:d1_uno32), data GPIO16, 256 LEDs, GRB.
@@ -33,8 +35,12 @@
 
 // Loudness sensor (Particle kit, analog out) — interim trigger until the
 // XIAO listener board arrives. GPIO34 = A3, ADC1: input-only, no WiFi clash.
-#define MIC_PIN           34
-#define LOUD_PP_THRESHOLD 250  // CALIBRATION KNOB — measured: quiet room pp=0, shout at 1 m pp≈260-670
+// Measured: the output is an envelope resting at 0 in silence; loud sound
+// lifts it to ~250-670. It also emits brief spikes after loud events, so
+// "loud" additionally requires the level to be SUSTAINED (see trigger block).
+#define MIC_PIN    34
+#define LOUD_LEVEL 250         // CALIBRATION KNOB — envelope level that counts as loud;
+                               // measured: quiet room = 0, shout at 1 m ≈ 260-670
 
 // Per-panel serpentine. CALIBRATION KNOBS — fixed against a real panel (see
 // panel_test): true flips X across every row, matching this panel's wiring.
@@ -152,8 +158,8 @@ void drawCentered(const char* s, CRGB c, int scale) {
 // Blink a centred string `times`, onMs lit / offMs dark, at the given scale.
 void blinkCentered(const char* s, CRGB c, int onMs, int offMs, int times, int scale) {
   for (int i = 0; i < times; i++) {
-    FastLED.clear(); drawCentered(s, c, scale); FastLED.show(); delay(onMs);
-    FastLED.clear();                            FastLED.show(); delay(offMs);
+    FastLED.clear(); drawCentered(s, c, scale); FastLED.show(); listenDelay(onMs, false);
+    FastLED.clear();                            FastLED.show(); listenDelay(offMs, false);
   }
 }
 
@@ -174,9 +180,9 @@ void drawFish(int x, int y, CRGB c, bool faceRight) {
 void swim(CRGB c, bool faceRight, int stepMs) {
   int y = (H - FISH_H) / 2;
   if (faceRight)
-    for (int x = -FISH_W; x <= W; x++) { FastLED.clear(); drawFish(x, y, c, true);  FastLED.show(); delay(stepMs); }
+    for (int x = -FISH_W; x <= W; x++) { FastLED.clear(); drawFish(x, y, c, true);  FastLED.show(); listenDelay(stepMs, false); }
   else
-    for (int x = W; x >= -FISH_W; x--) { FastLED.clear(); drawFish(x, y, c, false); FastLED.show(); delay(stepMs); }
+    for (int x = W; x >= -FISH_W; x--) { FastLED.clear(); drawFish(x, y, c, false); FastLED.show(); listenDelay(stepMs, false); }
 }
 
 // ---- Time (NTP over WiFi) ----
@@ -310,10 +316,10 @@ void drawStatPage(char label, uint32_t val, bool known) {
 const int STAT_MS = 2000;     // how long each counter stays up (tunable)
 void showCounterSweep() {
   bool known = timeKnown();
-  drawStatPage('H', lastHourCount(), true);  listenDelay(STAT_MS);  // last hour (uptime-based, no clock needed)
-  drawStatPage('T', g_today,         known); listenDelay(STAT_MS);  // today
-  drawStatPage('E', g_yest,          known); listenDelay(STAT_MS);  // yesterday
-  drawStatPage('Y', g_total,         true ); listenDelay(STAT_MS);  // total (always known)
+  drawStatPage('H', lastHourCount(), true);  listenDelay(STAT_MS, true);  // last hour (uptime-based, no clock needed)
+  drawStatPage('T', g_today,         known); listenDelay(STAT_MS, true);  // today
+  drawStatPage('E', g_yest,          known); listenDelay(STAT_MS, true);  // yesterday
+  drawStatPage('Y', g_total,         true ); listenDelay(STAT_MS, true);  // total (always known)
 }
 
 // ---- Detection animations (single-panel prototype content) ----
@@ -329,7 +335,7 @@ void animOtaSiikaPois() {
   const char* words[] = {"OTA", "SIIKA", "POIS"};
   for (int cycle = 0; cycle < 2; cycle++)     // two passes
     for (int w = 0; w < 3; w++) {
-      FastLED.clear(); drawCentered(words[w], TEXT_COLOR, 1); FastLED.show(); delay(500);
+      FastLED.clear(); drawCentered(words[w], TEXT_COLOR, 1); FastLED.show(); listenDelay(500, false);
     }
 }
 
@@ -341,7 +347,7 @@ void animBigSiika() {
     char one[2] = {letters[i], 0};
     FastLED.clear();
     drawText((W - textWidth(one, 2)) / 2, (H - FONT_H * 2) / 2, one, TEXT_COLOR, 2);
-    FastLED.show(); delay(300);
+    FastLED.show(); listenDelay(300, false);
   }
   blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 5, 1);
 }
@@ -352,7 +358,7 @@ void animMilestone() {
     FastLED.clear();
     for (int i = 0; i < 12; i++)                         // 12 lit px: USB-safe
       setPx(random(W), random(H), CHSV(random(256), 255, 255));
-    FastLED.show(); delay(30);
+    FastLED.show(); listenDelay(30, false);
   }
 }
 
@@ -369,36 +375,58 @@ void playNextDetectionAnim() {
 }
 
 // ---- Trigger (single swap point) ----
-// Loudness sensor: listenDelay() samples MIC_PIN while the counter sweep shows
-// and latches g_heard on a loud peak. Animations never listen -> natural cooldown.
-// ponytail: swap the latch for digitalRead(TRIGGER_PIN) when the listener
-// board arrives (see voice-trigger.md) — this stays the only swap point.
-bool g_heard = false;
+// "Loud" = envelope >= LOUD_LEVEL sustained for LOUD_MIN_SAMPLES (a leaky
+// score) — a shout holds the level for hundreds of ms and passes; the
+// sensor's brief after-spikes are a few samples and never do. A loud moment
+// counts as a NEW siika only when >= QUIET_GAP_MS of silence precedes it;
+// ongoing noise keeps refreshing g_lastLoudMs, so back-to-back
+// SIIKA,SIIKA,SIIKA with no pause merges into one. Every wait in the sweep
+// AND the animations is a listenDelay(), so the mic never closes; the loop
+// drains g_pending one animation per catch.
+// ponytail: swap the mic sampling for digitalRead(TRIGGER_PIN) when the
+// listener board arrives (see voice-trigger.md) — this stays the only swap point.
+const int      LOUD_MIN_SAMPLES = 200;  // CALIBRATION KNOB — ~20 ms of sustained sound
+                                        // at ADC speed; spikes are a few samples
+const uint32_t QUIET_GAP_MS     = 1250; // CALIBRATION KNOB — silence required between
+                                        // two siikas; anything closer merges into one
+const uint8_t  PENDING_MAX      = 10;   // ponytail: queue cap so sustained noise can't
+                                        // lock the panel into animations forever
+uint8_t  g_pending    = 0;              // detections waiting for their animation
+uint32_t g_lastLoudMs = 0;              // last moment the room was genuinely loud
+int      g_loudScore  = 0;              // leaky count of above-threshold samples;
+                                        // global so a shout bridges animation frames
 
-// delay(ms) that keeps the mic open: peak-to-peak over the window, early exit
-// on a hit so a clap reacts instantly (the guard skips the sweep's remaining
-// pages). Prints pp for threshold calibration.
-void listenDelay(uint32_t ms) {
-  if (g_heard) return;                  // already latched — fall through fast
+// delay(ms) that keeps the mic open. breakOnHit = early exit (idle sweep
+// reacts instantly); animations pass false so their frame timing is
+// untouched. Prints peak level + sample count for calibration on
+// sweep-length windows only (animation frames are 30-500 ms and would spam
+// serial).
+void listenDelay(uint32_t ms, bool breakOnHit) {
   uint32_t start = millis();
-  int lo = 4095, hi = 0;
+  int peak = 0; uint32_t n = 0;
   while (millis() - start < ms) {
     int v = analogRead(MIC_PIN);
-    if (v < lo) lo = v;
-    if (v > hi) hi = v;
-    if (hi - lo >= LOUD_PP_THRESHOLD) {
-      g_heard = true;
-      Serial.printf("mic TRIGGER pp=%d\n", hi - lo);
-      return;
+    n++;
+    if (v > peak) peak = v;
+    if (v >= LOUD_LEVEL) { if (g_loudScore < LOUD_MIN_SAMPLES) g_loudScore++; }
+    else                 { if (g_loudScore > 0)                g_loudScore--; }
+    if (g_loudScore >= LOUD_MIN_SAMPLES) {        // sustained loud right now
+      bool newSiika = millis() - g_lastLoudMs >= QUIET_GAP_MS;
+      g_lastLoudMs = millis();
+      if (newSiika) {
+        if (g_pending < PENDING_MAX) g_pending++;
+        Serial.printf("mic TRIGGER peak=%d pending=%u\n", peak, g_pending);
+        if (breakOnHit) return;
+      }
     }
   }
-  Serial.printf("mic pp=%d\n", hi - lo);
+  if (ms >= 500) Serial.printf("mic peak=%d n=%lu\n", peak, (unsigned long)n);
 }
 
-bool siikaDetected() {
-  bool h = g_heard;
-  g_heard = false;
-  return h;
+bool takeDetection() {
+  if (!g_pending) return false;
+  g_pending--;
+  return true;
 }
 
 // ---- Self-check: the non-trivial counter logic, no NVS/time needed ----
@@ -448,8 +476,8 @@ void setup() {
 
 void loop() {
   showCounterSweep();                 // idle: counters up + mic listening
-  if (siikaDetected()) {              // loud sound latched during the sweep
-    recordDetection(nowEpoch());
+  while (takeDetection()) {           // drain the queue: one animation per catch;
+    recordDetection(nowEpoch());      // shouts during a replay queue more replays
     playNextDetectionAnim();
     FastLED.clear(); FastLED.show();
   }

@@ -30,7 +30,16 @@ the sweep and reacts instantly). `siikaDetected()` consumes the latch — it
 stays the single swap point the listener-board GPIO replaces later. The
 always-true placeholder body is deleted.
 
-- Panel is deaf during animations → natural cooldown, no extra code.
+Update 2026-07-13: measured sensor output is an envelope resting at 0, so
+detection is now *level* ≥ `LOUD_LEVEL` sustained ~20 ms (rejects the ghost
+spikes the sensor emits after loud events), not windowed peak-to-peak, and
+the latch is a queue — see "Detections during an animation" in
+`detection-and-idle.md`.
+
+- ~~Panel is deaf during animations → natural cooldown, no extra code.~~
+  Superseded 2026-07-13: the panel listens during animations too; each
+  detection heard mid-animation counts and queues one more replay — see
+  "Detections during an animation" in `detection-and-idle.md`.
 - `LOUD_PP_THRESHOLD` is the calibration knob; each window's peak-to-peak is
   printed to serial for tuning.
 

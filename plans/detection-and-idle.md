@@ -48,6 +48,56 @@ void loop() {
 }
 ```
 
+### Detections during an animation — queued, not lost (refined 2026-07-13)
+
+A SIIKA shouted while a detection animation is already playing must count.
+Every detection heard mid-animation increments the counter AND replays an
+animation once more: two shouts during an animation → counter +2, animation
+plays twice more. The panel was previously deaf during animations, so those
+catches were silently dropped (supersedes the "natural cooldown" note in
+`loudness-trigger.md`).
+
+Mechanism (all in `firmware/siika/siika.ino`):
+
+- `bool g_heard` latch → `uint8_t g_pending` queue counter. A loud event
+  increments it; `takeDetection()` (replaces `siikaDetected()`) consumes one.
+- Every `delay()` inside animations and their primitives (`blinkCentered`,
+  `swim`, word/letter/milestone frames) becomes `listenDelay()` — the mic
+  stays open through the whole show. `delay()` in `setup()`/WiFi stays.
+- `listenDelay(ms, breakOnHit = false)` always waits the full window by
+  default so animation timing is untouched; the idle sweep passes
+  `breakOnHit = true` to keep its instant clap reaction.
+- Separation rule (refined 2026-07-13): two SIIKAs are distinct only when at
+  least **1.25 s of silence** (`QUIET_GAP_MS`, calibration knob) separates
+  them. Back-to-back "SIIKA,SIIKA,SIIKA" with no pause = one SIIKA;
+  SIIKA <1.26 s> SIIKA <1.26 s> SIIKA = three. Mechanism: the mic never goes
+  deaf — every loud moment refreshes a `g_lastLoudMs` stamp, and a loud event
+  counts as a new SIIKA only when the previous loud moment is ≥ 1.25 s old,
+  so ongoing noise keeps merging into the same SIIKA.
+- What "loud" means (measured 2026-07-13): the sensor outputs an envelope
+  resting at 0 in silence, ~250–670 during a shout — and it emits brief
+  ghost spikes for ~20 s after loud events (peak-to-peak over a window is
+  the wrong measure and ghost-triggered). Loud = level ≥ `LOUD_LEVEL`
+  sustained for `LOUD_MIN_SAMPLES` (a leaky score, ~20 ms of real sound);
+  spikes last a few samples and never pass.
+- The loop drains the queue one detection at a time; shouts during a replay
+  queue further replays:
+
+```c
+void loop() {
+  showCounterSweep();              // idle: listens, breaks early on a hit
+  while (takeDetection()) {        // consume one queued detection
+    recordDetection(nowEpoch());
+    playNextDetectionAnim();       // still listening: new shouts queue up
+  }
+  FastLED.clear(); FastLED.show();
+}
+```
+
+- ponytail: `PENDING_MAX = 10` caps the queue so sustained noise can't lock
+  the panel into animations (and inflate the counter) forever; raise it if a
+  real shouting crowd ever hits the cap.
+
 ## Counter + persistence
 
 Four numbers to show: **last hour, today, yesterday, total**. Must survive power
