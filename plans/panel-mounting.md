@@ -67,7 +67,7 @@ so every wire must reach the back. Chosen build:
 - **One data line per group** (4 lines → 4 GPIOs): short runs + data isolation
   (a dead group won't break others), AND real FPS — the 4 lines transmit in
   parallel on separate RMT channels. Decision 2026-07: switch NeoPixel →
-  **FastLED** for parallel output (see fastled-migration.md). 4 × 768 LEDs
+  **FastLED** for parallel output (see architecture.md). 4 × 768 LEDs
   concurrently ≈ 23 ms → ~43 fps, vs ~10 fps for one 3072-LED chain.
 
 ### Current budget / why the panel's 20 AWG is fine
@@ -130,7 +130,7 @@ stay the default instead of forcing the fully-reversible mount.
 - [ ] Diffuser yes/no, and depth → affects whether a front frame is wanted.
 - [ ] Orientation (data arrow) per cell → coordinate with firmware mapping.
 - [x] **Refresh / driver** → FastLED, one parallel data line per group of 3
-  (see fastled-migration.md).
+  (see architecture.md).
 
 ## Out of scope
 
