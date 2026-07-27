@@ -518,9 +518,10 @@ void setup() {
                 PANELS_X, PANELS_Y, W, H, TEST_MODE);
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
-  // MEAN WELL LRS-150F-5 (30 A): 6 A ≈ 2 A/panel — 5x PSU margin, safe on
-  // hookup wire. Raise once the final 10 AWG distribution is wired.
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, 6000);
+  // One panel group (3 panels) is fused at 5 A — the limiter must stay under
+  // the fuse. Revisit for the 12-panel wall: 4 groups, 5 A fuse each, and a
+  // global limiter can't enforce per-group caps (see multi-panel-power.md).
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, 5000);
   FastLED.clear();
   FastLED.show();
 
