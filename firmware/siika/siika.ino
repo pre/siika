@@ -4,10 +4,12 @@
 //   idle      -> cycle stat pages (last hour / today / yesterday / total)
 //   detected  -> record the catch, play the next detection animation, back to idle
 //
-// Trigger is one swap point (takeDetection): loudness sensor on GPIO34 now
+// Trigger is one swap point (micSample): loudness sensor on GPIO34 now
 // (see plans/loudness-trigger.md), digitalRead of the listener board's GPIO
-// later. The mic stays open during animations: every detection queues one
-// more replay and one more count (see plans/detection-and-idle.md).
+// later. loop() is a free-running frame loop (plans/nonblocking-render.md):
+// each renderer draws a frame, holds it, steps again; the mic is sampled
+// between frames, so every detection during an animation queues one more
+// replay and one more count (see plans/detection-and-idle.md).
 // Counts persist in NVS across power loss. Wall-clock
 // time comes from NTP over WiFi (creds in secrets.h) so today/yesterday/hour are real.
 //
@@ -175,14 +177,6 @@ void drawCentered(const char* s, CRGB c, int scale) {
   drawText((W - textWidth(s, scale)) / 2, (H - FONT_H * scale) / 2, s, c, scale);
 }
 
-// Blink a centred string `times`, onMs lit / offMs dark, at the given scale.
-void blinkCentered(const char* s, CRGB c, int onMs, int offMs, int times, int scale) {
-  for (int i = 0; i < times; i++) {
-    FastLED.clear(); drawCentered(s, c, scale); FastLED.show(); listenDelay(onMs, false);
-    FastLED.clear();                            FastLED.show(); listenDelay(offMs, false);
-  }
-}
-
 // ---- Fish sprite: 9x7, mirrored by facing ----
 #define FISH_W 9
 #define FISH_H 7
@@ -195,14 +189,6 @@ void drawFish(int x, int y, CRGB c, bool faceRight) {
         int dx = faceRight ? col : (FISH_W - 1 - col);
         setPx(x + dx, y + r, c);
       }
-}
-
-void swim(CRGB c, bool faceRight, int stepMs) {
-  int y = (H - FISH_H) / 2;
-  if (faceRight)
-    for (int x = -FISH_W; x <= W; x++) { FastLED.clear(); drawFish(x, y, c, true);  FastLED.show(); listenDelay(stepMs, false); }
-  else
-    for (int x = W; x >= -FISH_W; x--) { FastLED.clear(); drawFish(x, y, c, false); FastLED.show(); listenDelay(stepMs, false); }
 }
 
 // ---- Time (NTP over WiFi) ----
@@ -315,6 +301,17 @@ void recordDetection(uint32_t t) {
   // NVS endurance. Add batching only if catches ever become high-frequency.
 }
 
+// ---- Frame loop: modes + per-frame hold (plans/nonblocking-render.md) ----
+// Every renderer is a step function: called when its hold expires, draws the
+// next frame, holds it, returns true when finished. loop() samples the mic
+// between frames.
+enum Mode { MODE_IDLE, MODE_ANIM };    // DRAW, CLOCK arrive with the web UI
+Mode g_mode = MODE_IDLE;
+uint32_t g_holdUntil = 0;              // current frame stays up until this millis()
+int g_ph = 0, g_i = 0;                 // per-animation phase/step, reset by beginAnim
+
+void hold(uint32_t ms) { g_holdUntil = millis() + ms; }
+
 // ---- Idle stats display (single panel: label on top, number below) ----
 void numToStr(uint32_t n, char* buf) {
   if (n > 9999) { strcpy(buf, "9999"); return; }   // 1-panel cap; wall shows real value
@@ -331,68 +328,106 @@ void drawStatPage(char label, uint32_t val, bool known) {
   FastLED.show();
 }
 
-// Idle: sweep the four counters, STAT_MS each, so every number is readable. Shown
-// before every animation and doubles as the idle view when no siika is detected.
+// Idle: sweep the four counters, STAT_MS each, so every number is readable.
+// Never done — runs until a detection switches the mode.
 const int STAT_MS = 2000;     // how long each counter stays up (tunable)
-void showCounterSweep() {
+int g_idlePage = 0;
+void stepIdle() {
   bool known = timeKnown();
-  drawStatPage('H', lastHourCount(), true);  listenDelay(STAT_MS, true);  // last hour (uptime-based, no clock needed)
-  drawStatPage('T', g_today,         known); listenDelay(STAT_MS, true);  // today
-  drawStatPage('E', g_yest,          known); listenDelay(STAT_MS, true);  // yesterday
-  drawStatPage('Y', g_total,         true ); listenDelay(STAT_MS, true);  // total (always known)
+  switch (g_idlePage) {
+    case 0: drawStatPage('H', lastHourCount(), true);  break;  // last hour (uptime-based, no clock needed)
+    case 1: drawStatPage('T', g_today,         known); break;  // today
+    case 2: drawStatPage('E', g_yest,          known); break;  // yesterday
+    case 3: drawStatPage('Y', g_total,         true ); break;  // total (always known)
+  }
+  hold(STAT_MS);
+  g_idlePage = (g_idlePage + 1) % 4;
 }
 
 // ---- Detection animations (single-panel prototype content) ----
+// Each is a step function: entry check for done (so the last frame's hold
+// runs out before the transition), draw, hold, advance.
 
-// 1. Fish swims across left->right, then right->left.
-void animFishSwim() { swim(FISH_COLOR, true, 45); swim(FISH_COLOR, false, 45); }
-
-// 2. "SIIKA" blinks 3x at 0.5 s, as big as the canvas allows.
-void animSiikaTriple() { blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 3, fitScale("SIIKA")); }
-
-// 3. "OTA SIIKA POIS" one word at a time (whole-phrase blink needs the full wall).
-//    SIIKA is the widest word, so its fitScale keeps all three words uniform.
-void animOtaSiikaPois() {
-  const char* words[] = {"OTA", "SIIKA", "POIS"};
-  int sc = fitScale("SIIKA");
-  for (int cycle = 0; cycle < 2; cycle++)     // two passes
-    for (int w = 0; w < 3; w++) {
-      FastLED.clear(); drawCentered(words[w], TEXT_COLOR, sc); FastLED.show(); listenDelay(500, false);
-    }
+// 1. Fish swims across left->right (g_ph 0), then right->left (g_ph 1).
+bool stepFishSwim() {
+  if (g_ph >= 2) return true;
+  int span = W + FISH_W;                      // x runs -FISH_W..W inclusive
+  int y = (H - FISH_H) / 2;
+  FastLED.clear();
+  if (g_ph == 0) drawFish(-FISH_W + g_i, y, FISH_COLOR, true);
+  else           drawFish(W - g_i,       y, FISH_COLOR, false);
+  FastLED.show(); hold(45);
+  if (++g_i > span) { g_i = 0; g_ph++; }
+  return false;
 }
 
-// 4. Spell S-I-I-K-A one big letter at a time, then the whole word blinks 5x.
-void animBigSiika() {
+// 2. "SIIKA" blinks 3x at 0.5 s: g_i counts half-cycles, even = lit.
+bool stepSiikaTriple() {
+  if (g_i >= 6) return true;
+  FastLED.clear();
+  if (!(g_i & 1)) drawCentered("SIIKA", TEXT_COLOR, fitScale("SIIKA"));
+  FastLED.show(); hold(250);
+  g_i++;
+  return false;
+}
+
+// 3. "OTA SIIKA POIS" one word at a time, two passes (whole-phrase blink
+//    needs the full wall). SIIKA is the widest word, so its fitScale keeps
+//    all three words uniform.
+bool stepOtaSiikaPois() {
+  if (g_i >= 6) return true;
+  const char* words[] = {"OTA", "SIIKA", "POIS"};
+  FastLED.clear();
+  drawCentered(words[g_i % 3], TEXT_COLOR, fitScale("SIIKA"));
+  FastLED.show(); hold(500);
+  g_i++;
+  return false;
+}
+
+// 4. Spell S-I-I-K-A one big letter at a time (g_ph 0), then blink 5x (g_ph 1).
+bool stepBigSiika() {
+  if (g_ph == 1 && g_i >= 10) return true;    // 5 blinks = 10 half-cycles
   const char* letters = "SIIKA";
-  int lsc = fitScale("A");                    // one letter, as big as the height allows
-  for (int i = 0; letters[i]; i++) {
-    char one[2] = {letters[i], 0};
-    FastLED.clear();
-    drawCentered(one, TEXT_COLOR, lsc);
-    FastLED.show(); listenDelay(300, false);
+  FastLED.clear();
+  if (g_ph == 0) {
+    char one[2] = {letters[g_i], 0};
+    drawCentered(one, TEXT_COLOR, fitScale("A"));   // as big as the height allows
+    FastLED.show(); hold(300);
+    if (++g_i >= 5) { g_ph = 1; g_i = 0; }
+  } else {
+    if (!(g_i & 1)) drawCentered("SIIKA", TEXT_COLOR, fitScale("SIIKA"));
+    FastLED.show(); hold(250);
+    g_i++;
   }
-  blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 5, fitScale("SIIKA"));
+  return false;
 }
 
 // Milestone: every 10th catch gets a sparkle/rainbow burst instead of rotation.
-void animMilestone() {
-  for (int f = 0; f < 60; f++) {
-    FastLED.clear();
-    for (int i = 0; i < 12 * PANELS_X * PANELS_Y; i++)   // same density per panel
-      setPx(random(W), random(H), CHSV(random(256), 255, 255));
-    FastLED.show(); listenDelay(30, false);
-  }
+bool stepMilestone() {
+  if (g_i >= 60) return true;
+  FastLED.clear();
+  for (int i = 0; i < 12 * PANELS_X * PANELS_Y; i++)   // same density per panel
+    setPx(random(W), random(H), CHSV(random(256), 255, 255));
+  FastLED.show(); hold(30);
+  g_i++;
+  return false;
 }
 
 // ---- Registry + rotation ----
-typedef void (*Animation)();
-Animation animations[] = { animFishSwim, animSiikaTriple, animOtaSiikaPois, animBigSiika };
+typedef bool (*AnimStep)();
+AnimStep animations[] = { stepFishSwim, stepSiikaTriple, stepOtaSiikaPois, stepBigSiika };
 const int NUM_ANIMS = sizeof(animations) / sizeof(animations[0]);
-int animIdx = 0;
+int animIdx   = 0;             // rotation position for detection animations
+int g_testIdx = 0;             // TEST_MODE rotation position (anims + milestone)
+AnimStep g_anim = nullptr;     // currently running animation
 
-void playNextDetectionAnim() {
-  if (g_total % 10 == 0) { animMilestone(); return; }   // celebrate every 10th
-  animations[animIdx]();
+// Plain fn-pointer type in the signature: the .ino preprocessor hoists the
+// generated prototype above the AnimStep typedef.
+void beginAnim(bool (*a)()) { g_anim = a; g_ph = 0; g_i = 0; g_holdUntil = 0; }
+
+void beginNextDetectionAnim() {
+  if (g_total % 10 == 0) { beginAnim(stepMilestone); return; }   // celebrate every 10th
+  beginAnim(animations[animIdx]);
   animIdx = (animIdx + 1) % NUM_ANIMS;
 }
 
@@ -402,9 +437,9 @@ void playNextDetectionAnim() {
 // sensor's brief after-spikes are a few samples and never do. A loud moment
 // counts as a NEW siika only when >= QUIET_GAP_MS of silence precedes it;
 // ongoing noise keeps refreshing g_lastLoudMs, so back-to-back
-// SIIKA,SIIKA,SIIKA with no pause merges into one. Every wait in the sweep
-// AND the animations is a listenDelay(), so the mic never closes; the loop
-// drains g_pending one animation per catch.
+// SIIKA,SIIKA,SIIKA with no pause merges into one. loop() calls micSample()
+// on every pass, so the mic never closes between frames; the loop drains
+// g_pending one animation per catch.
 // ponytail: swap the mic sampling for digitalRead(TRIGGER_PIN) when the
 // listener board arrives (see voice-trigger.md) — this stays the only swap point.
 const int      LOUD_MIN_SAMPLES = 200;  // CALIBRATION KNOB — ~20 ms of sustained sound
@@ -418,34 +453,32 @@ uint32_t g_lastLoudMs = 0;              // last moment the room was genuinely lo
 int      g_loudScore  = 0;              // leaky count of above-threshold samples;
                                         // global so a shout bridges animation frames
 
-// delay(ms) that keeps the mic open. breakOnHit = early exit (idle sweep
-// reacts instantly); animations pass false so their frame timing is
-// untouched. Prints peak level + sample count for calibration on
-// sweep-length windows only (animation frames are 30-500 ms and would spam
-// serial).
-void listenDelay(uint32_t ms, bool breakOnHit) {
-#if TEST_MODE
-  delay(ms); return;             // test rig: keep frame timing, never read the mic
-#endif
-  uint32_t start = millis();
-  int peak = 0; uint32_t n = 0;
-  while (millis() - start < ms) {
-    int v = analogRead(MIC_PIN);
-    n++;
-    if (v > peak) peak = v;
-    if (v >= LOUD_LEVEL) { if (g_loudScore < LOUD_MIN_SAMPLES) g_loudScore++; }
-    else                 { if (g_loudScore > 0)                g_loudScore--; }
-    if (g_loudScore >= LOUD_MIN_SAMPLES) {        // sustained loud right now
-      bool newSiika = millis() - g_lastLoudMs >= QUIET_GAP_MS;
-      g_lastLoudMs = millis();
-      if (newSiika) {
-        if (g_pending < PENDING_MAX) g_pending++;
-        Serial.printf("mic TRIGGER peak=%d pending=%u\n", peak, g_pending);
-        if (breakOnHit) return;
-      }
+int      g_micPeak = 0;                 // peak level since the last calibration print
+uint32_t g_micN = 0;                    // samples since the last calibration print
+uint32_t g_micPrintMs = 0;
+
+// One mic sample + trigger scoring per loop() pass — the mic stays open
+// between frames, closed only during FastLED.show(), same as before. Prints
+// peak level + sample count for calibration every 2 s while idle (animation-
+// time prints would spam serial).
+void micSample() {
+  int v = analogRead(MIC_PIN);
+  g_micN++;
+  if (v > g_micPeak) g_micPeak = v;
+  if (v >= LOUD_LEVEL) { if (g_loudScore < LOUD_MIN_SAMPLES) g_loudScore++; }
+  else                 { if (g_loudScore > 0)                g_loudScore--; }
+  if (g_loudScore >= LOUD_MIN_SAMPLES) {        // sustained loud right now
+    bool newSiika = millis() - g_lastLoudMs >= QUIET_GAP_MS;
+    g_lastLoudMs = millis();
+    if (newSiika) {
+      if (g_pending < PENDING_MAX) g_pending++;
+      Serial.printf("mic TRIGGER peak=%d pending=%u\n", g_micPeak, g_pending);
     }
   }
-  if (ms >= 500) Serial.printf("mic peak=%d n=%lu\n", peak, (unsigned long)n);
+  if (g_mode == MODE_IDLE && millis() - g_micPrintMs >= 2000) {
+    Serial.printf("mic peak=%d n=%lu\n", g_micPeak, (unsigned long)g_micN);
+    g_micPrintMs = millis(); g_micPeak = 0; g_micN = 0;
+  }
 }
 
 bool takeDetection() {
@@ -506,18 +539,32 @@ void setup() {
 
 void loop() {
 #if TEST_MODE
-  for (int i = 0; i < NUM_ANIMS; i++) {        // every animation back-to-back...
-    animations[i]();
-    FastLED.clear(); FastLED.show(); delay(400);
+  if (millis() < g_holdUntil) return;          // current frame / gap still up
+  if (!g_anim) {                               // gap over: next in rotation,
+    beginAnim(g_testIdx < NUM_ANIMS ? animations[g_testIdx] : stepMilestone);
+    g_testIdx = (g_testIdx + 1) % (NUM_ANIMS + 1);   // milestone included
   }
-  animMilestone();                             // ...milestone included, then repeat
-  FastLED.clear(); FastLED.show(); delay(400);
-  return;
+  if (g_anim()) { g_anim = nullptr; FastLED.clear(); FastLED.show(); hold(400); }
+#else
+  micSample();
+  if (g_mode == MODE_IDLE && takeDetection()) {   // reacts within one pass
+    recordDetection(nowEpoch());
+    beginNextDetectionAnim();
+    g_mode = MODE_ANIM;
+  }
+  if (millis() < g_holdUntil) return;          // current frame still up
+  if (g_mode == MODE_ANIM) {
+    if (g_anim()) {                            // finished: drain the queue —
+      FastLED.clear(); FastLED.show();         // one animation per catch;
+      if (takeDetection()) {                   // shouts during a replay queued more
+        recordDetection(nowEpoch());
+        beginNextDetectionAnim();
+      } else {
+        g_mode = MODE_IDLE; g_idlePage = 0;
+      }
+    }
+  } else {
+    stepIdle();
+  }
 #endif
-  showCounterSweep();                 // idle: counters up + mic listening
-  while (takeDetection()) {           // drain the queue: one animation per catch;
-    recordDetection(nowEpoch());      // shouts during a replay queue more replays
-    playNextDetectionAnim();
-    FastLED.clear(); FastLED.show();
-  }
 }
