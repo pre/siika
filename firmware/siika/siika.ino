@@ -1,4 +1,4 @@
-// Siikapaneeli — detection show + idle stats (single-panel prototype, USB-powered).
+// Siikapaneeli — detection show + idle stats (three-panel test rig, MEAN WELL power).
 //
 // Two states (see plans/detection-and-idle.md):
 //   idle      -> cycle stat pages (last hour / today / yesterday / total)
@@ -11,8 +11,9 @@
 // Counts persist in NVS across power loss. Wall-clock
 // time comes from NTP over WiFi (creds in secrets.h) so today/yesterday/hour are real.
 //
-// Board: WEMOS D1 R32 (esp32:esp32:d1_uno32), data GPIO16, 256 LEDs, GRB.
-// POWER: still USB — BRIGHTNESS stays capped low; animations never fill the canvas.
+// Board: WEMOS D1 R32 (esp32:esp32:d1_uno32), data GPIO16, GRB.
+// POWER: MEAN WELL LRS-150F-5 feeds the panels directly; the FastLED power
+// limiter below is the content-aware hard cap.
 
 #include <FastLED.h>
 #include <Preferences.h>
@@ -21,8 +22,12 @@
 #include <assert.h>
 #include "secrets.h"          // WIFI_SSID, WIFI_PASS
 
+// Test rig switch: 1 = play every animation back-to-back forever, mic and
+// WiFi off. 0 = normal detection operation.
+#define TEST_MODE 1
+
 // ---- Canvas config (the scalability knob) ----
-#define PANELS_X 1              // panels across  (final 5-6)
+#define PANELS_X 3              // panels across  (final 5-6)
 #define PANELS_Y 1              // panels stacked (final 2)
 #define PANEL_W  16
 #define PANEL_H  16
@@ -31,7 +36,8 @@
 #define NUM_LEDS (W * H)
 
 #define DATA_PIN   16
-#define BRIGHTNESS 12          // USB-safe cap. Raise only on the MEAN WELL PSU.
+#define BRIGHTNESS 64          // MEAN WELL phase (~25%); the power limiter in
+                               // setup() is the real ceiling. On USB drop back to 12.
 
 // Loudness sensor (Particle kit, analog out) — interim trigger until the
 // XIAO listener board arrives. GPIO34 = A3, ADC1: input-only, no WiFi clash.
@@ -59,11 +65,17 @@ const CRGB FISH_COLOR  = CRGB(230, 90, 0);     // warm orange
 struct Glyph { char ch; uint8_t w; uint8_t rows[5]; };
 
 // ---- XY mapping: logical (x,y) -> LED index in the data chain ----
+static_assert(PANEL_W == PANEL_H, "90-degree rotation needs square panels");
+
 uint16_t localIndex(uint8_t lx, uint8_t ly) {   // index within one panel
-  bool rev = (ly & 1) ? SERPENTINE : false;
+  // CALIBRATION KNOB — wiring mounts each panel 90° CCW of the logical image
+  // (seen on the 1x1 rig), so pre-rotate every panel's frame 90° CW.
+  uint8_t rx = (PANEL_H - 1) - ly;
+  uint8_t ry = lx;
+  bool rev = (ry & 1) ? SERPENTINE : false;
   if (FIRST_ROW_REVERSED) rev = !rev;
-  if (rev) lx = (PANEL_W - 1) - lx;
-  return ly * (uint16_t)PANEL_W + lx;
+  if (rev) rx = (PANEL_W - 1) - rx;
+  return ry * (uint16_t)PANEL_W + rx;
 }
 
 // A panel's position in the chain. Row-major placeholder — CALIBRATION KNOB,
@@ -130,6 +142,14 @@ int textWidth(const char* s, int scale) {
     if (s[i + 1]) w += GAP;
   }
   return w * scale;
+}
+
+// Largest integer scale at which the string fits the canvas — text grows
+// with the panel count instead of floating tiny in the middle.
+int fitScale(const char* s) {
+  int sc = 1;
+  while (textWidth(s, sc + 1) <= W && FONT_H * (sc + 1) <= H) sc++;
+  return sc;
 }
 
 // Draw one glyph, each source pixel a scale x scale block.
@@ -327,36 +347,38 @@ void showCounterSweep() {
 // 1. Fish swims across left->right, then right->left.
 void animFishSwim() { swim(FISH_COLOR, true, 45); swim(FISH_COLOR, false, 45); }
 
-// 2. "SIIKA" blinks 3x at 0.5 s.
-void animSiikaTriple() { blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 3, 1); }
+// 2. "SIIKA" blinks 3x at 0.5 s, as big as the canvas allows.
+void animSiikaTriple() { blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 3, fitScale("SIIKA")); }
 
 // 3. "OTA SIIKA POIS" one word at a time (whole-phrase blink needs the full wall).
+//    SIIKA is the widest word, so its fitScale keeps all three words uniform.
 void animOtaSiikaPois() {
   const char* words[] = {"OTA", "SIIKA", "POIS"};
+  int sc = fitScale("SIIKA");
   for (int cycle = 0; cycle < 2; cycle++)     // two passes
     for (int w = 0; w < 3; w++) {
-      FastLED.clear(); drawCentered(words[w], TEXT_COLOR, 1); FastLED.show(); listenDelay(500, false);
+      FastLED.clear(); drawCentered(words[w], TEXT_COLOR, sc); FastLED.show(); listenDelay(500, false);
     }
 }
 
 // 4. Spell S-I-I-K-A one big letter at a time, then the whole word blinks 5x.
-//    (Big single letters fit 16 px; the whole word at scale 2 would not.)
 void animBigSiika() {
   const char* letters = "SIIKA";
+  int lsc = fitScale("A");                    // one letter, as big as the height allows
   for (int i = 0; letters[i]; i++) {
     char one[2] = {letters[i], 0};
     FastLED.clear();
-    drawText((W - textWidth(one, 2)) / 2, (H - FONT_H * 2) / 2, one, TEXT_COLOR, 2);
+    drawCentered(one, TEXT_COLOR, lsc);
     FastLED.show(); listenDelay(300, false);
   }
-  blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 5, 1);
+  blinkCentered("SIIKA", TEXT_COLOR, 250, 250, 5, fitScale("SIIKA"));
 }
 
 // Milestone: every 10th catch gets a sparkle/rainbow burst instead of rotation.
 void animMilestone() {
   for (int f = 0; f < 60; f++) {
     FastLED.clear();
-    for (int i = 0; i < 12; i++)                         // 12 lit px: USB-safe
+    for (int i = 0; i < 12 * PANELS_X * PANELS_Y; i++)   // same density per panel
       setPx(random(W), random(H), CHSV(random(256), 255, 255));
     FastLED.show(); listenDelay(30, false);
   }
@@ -402,6 +424,9 @@ int      g_loudScore  = 0;              // leaky count of above-threshold sample
 // sweep-length windows only (animation frames are 30-500 ms and would spam
 // serial).
 void listenDelay(uint32_t ms, bool breakOnHit) {
+#if TEST_MODE
+  delay(ms); return;             // test rig: keep frame timing, never read the mic
+#endif
   uint32_t start = millis();
   int peak = 0; uint32_t n = 0;
   while (millis() - start < ms) {
@@ -456,25 +481,39 @@ void selfTest() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println(F("\nSiikapaneeli — detection show + idle stats, GPIO16, single panel"));
+  Serial.printf("\nSiikapaneeli — %dx%d panels (%dx%d px), GPIO16, TEST_MODE=%d\n",
+                PANELS_X, PANELS_Y, W, H, TEST_MODE);
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, 400);  // hard USB cap, safety net
+  // MEAN WELL LRS-150F-5 (30 A): 6 A ≈ 2 A/panel — 5x PSU margin, safe on
+  // hookup wire. Raise once the final 10 AWG distribution is wired.
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, 6000);
   FastLED.clear();
   FastLED.show();
 
   selfTest();
   randomSeed(micros());
   loadCounters();
-  setupTime();
+#if !TEST_MODE
+  setupTime();                   // test rig boots fast, no WiFi/NTP
+#endif
 
   Serial.printf("total=%lu today=%u yest=%u curDay=%ld timeKnown=%d\n",
                 (unsigned long)g_total, g_today, g_yest, (long)g_curDay, timeKnown());
-  Serial.printf("widths: SIIKA(s1)=%d  S(s2)=%d (must be <=16)\n",
-                textWidth("SIIKA", 1), textWidth("S", 2));
+  Serial.printf("SIIKA fitScale=%d width=%d (must be <=%d)\n",
+                fitScale("SIIKA"), textWidth("SIIKA", fitScale("SIIKA")), W);
 }
 
 void loop() {
+#if TEST_MODE
+  for (int i = 0; i < NUM_ANIMS; i++) {        // every animation back-to-back...
+    animations[i]();
+    FastLED.clear(); FastLED.show(); delay(400);
+  }
+  animMilestone();                             // ...milestone included, then repeat
+  FastLED.clear(); FastLED.show(); delay(400);
+  return;
+#endif
   showCounterSweep();                 // idle: counters up + mic listening
   while (takeDetection()) {           // drain the queue: one animation per catch;
     recordDetection(nowEpoch());      // shouts during a replay queue more replays

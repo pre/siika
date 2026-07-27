@@ -2,18 +2,17 @@
 
 Siikapaneeli on WS2812B LED-valopaneeleista (16x16, 256 LED, 5V, GRB) tehty
 asennus, jota ohjaa Wemos D1 R32 (ESP32) mikrokontrolleri. Lopullinen asennus:
-12 paneelia (2 päällekkäin, 6 vierekkäin) ja MEAN WELL LRS-150F-5 -virtalähde
-(tilattu, ei vielä saapunut).
+12 paneelia (2 päällekkäin, 6 vierekkäin) ja MEAN WELL LRS-150F-5 -virtalähde.
 
-Nykytila: prototyyppi VALMIS — yksi paneeli toimii USB-virralla
-(ks. plans/prototype-phase.md). Seuraavat vaiheet omissa plans/-tiedostoissaan.
+Nykytila: kolmen vierekkäisen paneelin testi MEAN WELL -virtalähteellä
+(ks. plans/three-panel-test.md). Seuraavat vaiheet omissa plans/-tiedostoissaan.
 
 # Komponentit
 
 - WS2812B 16x16 -paneeli(t), Wemos D1 R32, DIN-kisko-ruuviliitinshield
 - Sulakerasia (12-paikkainen), ANL 60A -sulake + pohja, virtakaapelia
   10/14/16 AWG, pientarvikkeita
-- Tilattu: MEAN WELL LRS-150F-5
+- MEAN WELL LRS-150F-5 (saapunut, käytössä paneelitestissä)
 - Particle-kittien sensorit ja pienosat: ks. plans/particle-kits-inventory.md
 
 # Sähköturvallisuus (aina voimassa)
