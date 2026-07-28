@@ -4,8 +4,8 @@ Siikapaneeli on WS2812B LED-valopaneeleista (16x16, 256 LED, 5V, GRB) tehty
 asennus, jota ohjaa Wemos D1 R32 (ESP32) mikrokontrolleri. Lopullinen asennus:
 12 paneelia (2 päällekkäin, 6 vierekkäin) ja MEAN WELL LRS-150F-5 -virtalähde.
 
-Nykytila: kolmen vierekkäisen paneelin testi MEAN WELL -virtalähteellä
-(ks. plans/three-panel-test.md). Seuraavat vaiheet omissa plans/-tiedostoissaan.
+Nykytila: kuuden paneelin 2x3-testi MEAN WELL -virtalähteellä
+(ks. plans/six-panel-2x3.md). Seuraavat vaiheet omissa plans/-tiedostoissaan.
 
 # Komponentit
 
@@ -32,8 +32,8 @@ Nykytila: kolmen vierekkäisen paneelin testi MEAN WELL -virtalähteellä
   `ls /dev/cu.* | grep -i usbserial`.
 - `arduino-cli`, board `esp32:esp32:d1_uno32`. Uploadissa PAKKO käyttää
   `UploadSpeed=460800` (oletus 921600 korruptoi CH340:llä). Monitor 115200 baud.
-- FastLED-kirjasto (≥3.9, ei PlatformIO), data GPIO16,
-  serpentiini-XY-mappaus.
+- FastLED-kirjasto (≥3.9, ei PlatformIO), data GPIO16 (shield-pinni 5,
+  ylärivi) + GPIO17 (shield-pinni 4, alarivi), serpentiini-XY-mappaus.
 - Firmware: `firmware/siika/siika.ino` = varsinainen ohjelma,
   `firmware/panel_test/panel_test.ino` = diagnostiikka, ei muuteta.
 

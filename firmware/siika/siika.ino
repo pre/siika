@@ -13,7 +13,9 @@
 // Counts persist in NVS across power loss. Wall-clock
 // time comes from NTP over WiFi (creds in secrets.h) so today/yesterday/hour are real.
 //
-// Board: WEMOS D1 R32 (esp32:esp32:d1_uno32), data GPIO16, GRB.
+// Board: WEMOS D1 R32 (esp32:esp32:d1_uno32), GRB. Data: GPIO16 (shield pin 5,
+// row 0) + GPIO17 (shield pin 4, row 1) — one chain of 3 panels per row
+// (plans/six-panel-2x3.md); both RMT channels clock out in one show().
 // POWER: MEAN WELL LRS-150F-5 feeds the panels directly; the FastLED power
 // limiter below is the content-aware hard cap.
 
@@ -37,13 +39,18 @@
 // PANELS_X/Y are first-boot defaults; the runtime grid comes from settings
 // (panelsX/panelsY, applied at boot). leds[] is sized for the final wall.
 #define PANELS_X 3              // panels across  (final 5-6)
-#define PANELS_Y 1              // panels stacked (final 2)
+#define PANELS_Y 2              // panels stacked (final 2)
 #define PANEL_W  16
 #define PANEL_H  16
 #define PANELS_MAX 12           // final wall: 6 across, 2 stacked
 #define MAX_LEDS (PANELS_MAX * PANEL_W * PANEL_H)   // 3072 = 9.2 KB
 
-#define DATA_PIN   16
+#define DATA_PIN_A 16           // shield pin 5: row 0 chain
+#define DATA_PIN_B 17           // shield pin 4: row 1 chain (panelsY == 2 only)
+
+// Chain-layout CALIBRATION KNOBS — fixed against the real rig:
+#define ROWS_SWAPPED  false     // true if pin 4 turns out to drive the TOP row
+#define ROW1_MIRRORED false     // true if the second chain enters from the right
 #define BRIGHTNESS 64          // MEAN WELL phase (~25%); the power limiter in
                                // setup() is the real ceiling. On USB drop back to 12.
 
@@ -126,9 +133,14 @@ uint16_t localIndex(uint8_t lx, uint8_t ly) {   // index within one panel
   return ry * (uint16_t)PANEL_W + rx;
 }
 
-// A panel's position in the chain. Row-major placeholder — CALIBRATION KNOB,
-// fixed when real panels arrive. For 1 panel it is always 0.
-uint16_t panelIndex(uint8_t px, uint8_t py) { return py * g_set.panelsX + px; }
+// A panel's position in the data order: one chain per row, chains laid out
+// row-major in leds[] (row 0 = pin A slice, row 1 = pin B slice). The knobs
+// above absorb whichever way the rig was actually wired.
+uint16_t panelIndex(uint8_t px, uint8_t py) {
+  if (ROWS_SWAPPED) py = (g_set.panelsY - 1) - py;
+  if (ROW1_MIRRORED && py == 1) px = (g_set.panelsX - 1) - px;
+  return py * g_set.panelsX + px;
+}
 
 uint16_t XY(int x, int y) {
   uint8_t px = x / PANEL_W, py = y / PANEL_H;
@@ -429,11 +441,12 @@ void numToStr(uint32_t n, char* buf) {
 
 void drawStatPage(char label, uint32_t val, bool known) {
   FastLED.clear();
+  int sc = H / 16;               // 16 px layout, pixel-doubled on taller walls
   char lb[2] = {label, 0};
-  drawText((W - textWidth(lb, 1)) / 2, 1, lb, g_set.labelColor, 1);
+  drawText((W - textWidth(lb, sc)) / 2, 1 * sc, lb, g_set.labelColor, sc);
   char nb[8];
   if (known) numToStr(val, nb); else strcpy(nb, "--");
-  drawText((W - textWidth(nb, 1)) / 2, 9, nb, g_set.textColor, 1);
+  drawText((W - textWidth(nb, sc)) / 2, 9 * sc, nb, g_set.textColor, sc);
   FastLED.show();
 }
 
@@ -851,9 +864,15 @@ void setup() {
   W = g_set.panelsX * PANEL_W;   // grid is fixed for this boot
   H = g_set.panelsY * PANEL_H;
   NUM_LEDS = W * H;
-  Serial.printf("\nSiikapaneeli — %dx%d panels (%dx%d px), GPIO16, TEST_MODE=%d\n",
+  Serial.printf("\nSiikapaneeli — %dx%d panels (%dx%d px), GPIO16+17, TEST_MODE=%d\n",
                 g_set.panelsX, g_set.panelsY, W, H, TEST_MODE);
-  FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
+  if (g_set.panelsY == 2) {      // one chain per row, half of leds[] each
+    int half = NUM_LEDS / 2;
+    FastLED.addLeds<WS2812B, DATA_PIN_A, GRB>(leds, 0, half);
+    FastLED.addLeds<WS2812B, DATA_PIN_B, GRB>(leds, half, half);
+  } else {                       // single-row rigs: everything on pin A
+    FastLED.addLeds<WS2812B, DATA_PIN_A, GRB>(leds, NUM_LEDS);
+  }
   FastLED.setBrightness(g_set.brightness);
   // One panel group (3 panels) is fused at 5 A — the limiter must stay under
   // the fuse. Revisit for the 12-panel wall: 4 groups, 5 A fuse each, and a
