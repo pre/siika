@@ -1,3 +1,6 @@
 # WiFi credentials — real values live in secrets.h, never committed.
 # Commit secrets.h.example (placeholders) instead.
 firmware/siika/secrets.h
+
+# arduino-cli --export-binaries output (OTA images)
+firmware/*/build/

@@ -20,22 +20,27 @@
 #include <FastLED.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include <assert.h>
-#include "secrets.h"          // WIFI_SSID, WIFI_PASS
+#include "secrets.h"          // WIFI_SSID, WIFI_PASS, OTA_PASS
 
-// Test rig switch: 1 = play every animation back-to-back forever, mic and
-// WiFi off. 0 = normal detection operation.
-#define TEST_MODE 1
+// Test rig switch: 1 = play every animation back-to-back forever, mic, WiFi
+// and web off. 0 = normal detection operation.
+#define TEST_MODE 0
 
-// ---- Canvas config (the scalability knob) ----
+// ---- Canvas config ----
+// PANELS_X/Y are first-boot defaults; the runtime grid comes from settings
+// (panelsX/panelsY, applied at boot). leds[] is sized for the final wall.
 #define PANELS_X 3              // panels across  (final 5-6)
 #define PANELS_Y 1              // panels stacked (final 2)
 #define PANEL_W  16
 #define PANEL_H  16
-#define W        (PANELS_X * PANEL_W)   // logical canvas width
-#define H        (PANELS_Y * PANEL_H)   // logical canvas height
-#define NUM_LEDS (W * H)
+#define PANELS_MAX 12           // final wall: 6 across, 2 stacked
+#define MAX_LEDS (PANELS_MAX * PANEL_W * PANEL_H)   // 3072 = 9.2 KB
 
 #define DATA_PIN   16
 #define BRIGHTNESS 64          // MEAN WELL phase (~25%); the power limiter in
@@ -49,6 +54,11 @@
 #define MIC_PIN    34
 #define LOUD_LEVEL 250         // CALIBRATION KNOB — envelope level that counts as loud;
                                // measured: quiet room = 0, shout at 1 m ≈ 260-670
+#define LOUD_MIN_SAMPLES 200   // CALIBRATION KNOB — ~20 ms of sustained sound at ADC
+                               // speed; the sensor's after-spikes are a few samples
+#define QUIET_GAP_MS     1250  // CALIBRATION KNOB — silence required between two
+                               // siikas; anything closer merges into one
+#define STAT_MS          2000  // how long each idle counter page stays up
 
 // Per-panel serpentine. CALIBRATION KNOBS — fixed against a real panel (see
 // panel_test): true flips X across every row, matching this panel's wiring.
@@ -58,11 +68,37 @@
 // Helsinki time incl. DST — day/hour buckets need local, not UTC, day boundaries.
 #define TZ_HELSINKI "EET-2EEST,M3.5.0/3,M10.5.0/4"
 
-CRGB leds[NUM_LEDS];
+CRGB leds[MAX_LEDS];
 
-const CRGB TEXT_COLOR  = CRGB(160, 210, 220);  // cyan-white
-const CRGB LABEL_COLOR = CRGB(60, 90, 100);    // dim label
-const CRGB FISH_COLOR  = CRGB(230, 90, 0);     // warm orange
+// ---- Settings: one JSON blob in NVS; the #defines above are the first-boot
+// defaults. Everything applies live except the grid size (addLeds locks the
+// LED count at boot). Owned by the render task; the web task hands changes
+// over via g_pendingSet (see the web section).
+struct Settings {
+  uint8_t  brightness     = BRIGHTNESS;
+  uint16_t loudLevel      = LOUD_LEVEL;
+  uint16_t loudMinSamples = LOUD_MIN_SAMPLES;
+  uint32_t quietGapMs     = QUIET_GAP_MS;
+  uint16_t statMs         = STAT_MS;
+  uint8_t  panelsX        = PANELS_X;      // applied at next boot
+  uint8_t  panelsY        = PANELS_Y;      // applied at next boot
+  bool     serpentine     = SERPENTINE;
+  bool     firstRowRev    = FIRST_ROW_REVERSED;
+  CRGB     textColor      = CRGB(160, 210, 220);  // cyan-white
+  CRGB     labelColor     = CRGB(60, 90, 100);    // dim label
+  CRGB     fishColor      = CRGB(230, 90, 0);     // warm orange
+};
+Settings g_set;
+int W, H, NUM_LEDS;    // derived from g_set in setup(); grid changes need a reboot
+
+// Web -> render crossing (architecture.md rule: the web task never touches
+// leds[] or FastLED). The render loop applies these between frames in
+// applyWebInput(); status reads snapshot the counters under the same mutex.
+SemaphoreHandle_t g_mux;
+Settings g_pendingSet;
+volatile bool g_setPending = false;   // g_pendingSet waits to be applied
+volatile bool g_webTrigger = false;   // POST /api/trigger: fake one siika
+volatile bool g_otaActive  = false;   // flash write in progress: render freezes
 
 struct Glyph { char ch; uint8_t w; uint8_t rows[5]; };
 
@@ -74,15 +110,15 @@ uint16_t localIndex(uint8_t lx, uint8_t ly) {   // index within one panel
   // (seen on the 1x1 rig), so pre-rotate every panel's frame 90° CW.
   uint8_t rx = (PANEL_H - 1) - ly;
   uint8_t ry = lx;
-  bool rev = (ry & 1) ? SERPENTINE : false;
-  if (FIRST_ROW_REVERSED) rev = !rev;
+  bool rev = (ry & 1) ? g_set.serpentine : false;
+  if (g_set.firstRowRev) rev = !rev;
   if (rev) rx = (PANEL_W - 1) - rx;
   return ry * (uint16_t)PANEL_W + rx;
 }
 
 // A panel's position in the chain. Row-major placeholder — CALIBRATION KNOB,
 // fixed when real panels arrive. For 1 panel it is always 0.
-uint16_t panelIndex(uint8_t px, uint8_t py) { return py * PANELS_X + px; }
+uint16_t panelIndex(uint8_t px, uint8_t py) { return py * g_set.panelsX + px; }
 
 uint16_t XY(int x, int y) {
   uint8_t px = x / PANEL_W, py = y / PANEL_H;
@@ -212,21 +248,20 @@ int32_t localDayIndex(uint32_t t) {
   return daysFromCivil(lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
 }
 
-void setupTime() {
+// WiFi stays ON (architecture.md): the web server needs it, SNTP re-syncs the
+// clock periodically for free, and flicker is handled by the core split + RMT
+// hardware buffering. No NTP wait: timeKnown() flips when the sync lands.
+void setupWifi() {
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) delay(200);
-  if (WiFi.status() == WL_CONNECTED) {
-    configTzTime(TZ_HELSINKI, "pool.ntp.org", "time.nist.gov");
-    struct tm tmv;
-    uint32_t s2 = millis();
-    while (!getLocalTime(&tmv, 200) && millis() - s2 < 5000) { /* wait for sync */ }
-  }
-  // ponytail: WiFi off after the one sync — the internal RTC holds time while
-  // powered, and an idle radio can't glitch the WS2812B timing. Re-sync happens
-  // at the next cold boot. Upgrade path: a periodic re-sync if drift ever matters.
-  WiFi.mode(WIFI_OFF);
+  configTzTime(TZ_HELSINKI, "pool.ntp.org", "time.nist.gov");
+  if (MDNS.begin("siika")) MDNS.addService("http", "tcp", 80);
+  Serial.printf("WiFi %s, IP %s, http://siika.local\n",
+                WiFi.status() == WL_CONNECTED ? "connected" : "NOT connected (auto-retry)",
+                WiFi.localIP().toString().c_str());
 }
 
 // ---- Persistent counter (NVS via Preferences) ----
@@ -248,6 +283,66 @@ void saveCounters() {
   prefs.putInt   ("curDay", g_curDay);
   prefs.putUShort("today",  g_today);
   prefs.putUShort("yest",   g_yest);
+}
+
+// ---- Settings persistence: one JSON blob in the same NVS namespace ----
+void colorToHex(CRGB c, char *buf) { sprintf(buf, "%02X%02X%02X", c.r, c.g, c.b); }
+
+CRGB hexToColor(const char *h, CRGB fallback) {
+  if (!h || strlen(h) != 6) return fallback;
+  char *end; uint32_t v = strtoul(h, &end, 16);
+  if (*end) return fallback;
+  return CRGB(v >> 16, (v >> 8) & 0xFF, v & 0xFF);
+}
+
+void settingsJson(const Settings &s, String &out) {
+  JsonDocument d; char hex[7];
+  d["brightness"]     = s.brightness;
+  d["loudLevel"]      = s.loudLevel;
+  d["loudMinSamples"] = s.loudMinSamples;
+  d["quietGapMs"]     = s.quietGapMs;
+  d["statMs"]         = s.statMs;
+  d["panelsX"]        = s.panelsX;
+  d["panelsY"]        = s.panelsY;
+  d["serpentine"]     = s.serpentine;
+  d["firstRowRev"]    = s.firstRowRev;
+  colorToHex(s.textColor,  hex); d["textColor"]  = hex;
+  colorToHex(s.labelColor, hex); d["labelColor"] = hex;
+  colorToHex(s.fishColor,  hex); d["fishColor"]  = hex;
+  serializeJson(d, out);
+}
+
+// Overlay json onto s — missing keys keep their current values, everything
+// clamped at this trust boundary. Loads the NVS blob and POST /api/settings.
+bool settingsFromJson(const String &json, Settings &s, String &err) {
+  JsonDocument d;
+  if (deserializeJson(d, json)) { err = "bad json"; return false; }
+  s.brightness     = constrain((int)(d["brightness"]     | (int)s.brightness),     0, 255);
+  s.loudLevel      = constrain((int)(d["loudLevel"]      | (int)s.loudLevel),      0, 4095);
+  s.loudMinSamples = constrain((int)(d["loudMinSamples"] | (int)s.loudMinSamples), 1, 20000);
+  s.quietGapMs     = constrain((int)(d["quietGapMs"]     | (int)s.quietGapMs),     0, 600000);
+  s.statMs         = constrain((int)(d["statMs"]         | (int)s.statMs),       100, 60000);
+  s.panelsX        = constrain((int)(d["panelsX"]        | (int)s.panelsX),        1, PANELS_MAX);
+  s.panelsY        = constrain((int)(d["panelsY"]        | (int)s.panelsY),        1, PANELS_MAX);
+  if (s.panelsX * s.panelsY > PANELS_MAX) { err = "grid exceeds 12 panels"; return false; }
+  s.serpentine  = d["serpentine"]  | s.serpentine;
+  s.firstRowRev = d["firstRowRev"] | s.firstRowRev;
+  s.textColor   = hexToColor(d["textColor"]  | "", s.textColor);
+  s.labelColor  = hexToColor(d["labelColor"] | "", s.labelColor);
+  s.fishColor   = hexToColor(d["fishColor"]  | "", s.fishColor);
+  return true;
+}
+
+void loadSettings() {
+  String j = prefs.getString("set", "");
+  String err;
+  if (j.length() && !settingsFromJson(j, g_set, err))
+    Serial.printf("settings blob rejected (%s), using defaults\n", err.c_str());
+}
+
+void saveSettings(const Settings &s) {
+  String out; settingsJson(s, out);
+  prefs.putString("set", out);          // NVS API is internally thread-safe
 }
 
 // ---- Last-60-minutes rolling count: 60 one-minute buckets on uptime ----
@@ -290,12 +385,14 @@ void rollDay(int32_t d, int32_t &curDay, uint16_t &today, uint16_t &yest) {
 }
 
 void recordDetection(uint32_t t) {
+  xSemaphoreTake(g_mux, portMAX_DELAY);    // /api/status snapshots under the same mutex
   g_total++;
   bumpLastHour();                          // H is uptime-based: counts with or without NTP
   if (timeKnown()) {                       // today/yesterday need the wall clock
     rollDay(localDayIndex(t), g_curDay, g_today, g_yest);
     g_today++;
   }
+  xSemaphoreGive(g_mux);
   saveCounters();
   // ponytail: one NVS write per catch. Catches are minutes+ apart => nowhere near
   // NVS endurance. Add batching only if catches ever become high-frequency.
@@ -321,16 +418,15 @@ void numToStr(uint32_t n, char* buf) {
 void drawStatPage(char label, uint32_t val, bool known) {
   FastLED.clear();
   char lb[2] = {label, 0};
-  drawText((W - textWidth(lb, 1)) / 2, 1, lb, LABEL_COLOR, 1);
+  drawText((W - textWidth(lb, 1)) / 2, 1, lb, g_set.labelColor, 1);
   char nb[8];
   if (known) numToStr(val, nb); else strcpy(nb, "--");
-  drawText((W - textWidth(nb, 1)) / 2, 9, nb, TEXT_COLOR, 1);
+  drawText((W - textWidth(nb, 1)) / 2, 9, nb, g_set.textColor, 1);
   FastLED.show();
 }
 
-// Idle: sweep the four counters, STAT_MS each, so every number is readable.
+// Idle: sweep the four counters, statMs each, so every number is readable.
 // Never done — runs until a detection switches the mode.
-const int STAT_MS = 2000;     // how long each counter stays up (tunable)
 int g_idlePage = 0;
 void stepIdle() {
   bool known = timeKnown();
@@ -340,7 +436,7 @@ void stepIdle() {
     case 2: drawStatPage('E', g_yest,          known); break;  // yesterday
     case 3: drawStatPage('Y', g_total,         true ); break;  // total (always known)
   }
-  hold(STAT_MS);
+  hold(g_set.statMs);
   g_idlePage = (g_idlePage + 1) % 4;
 }
 
@@ -354,8 +450,8 @@ bool stepFishSwim() {
   int span = W + FISH_W;                      // x runs -FISH_W..W inclusive
   int y = (H - FISH_H) / 2;
   FastLED.clear();
-  if (g_ph == 0) drawFish(-FISH_W + g_i, y, FISH_COLOR, true);
-  else           drawFish(W - g_i,       y, FISH_COLOR, false);
+  if (g_ph == 0) drawFish(-FISH_W + g_i, y, g_set.fishColor, true);
+  else           drawFish(W - g_i,       y, g_set.fishColor, false);
   FastLED.show(); hold(45);
   if (++g_i > span) { g_i = 0; g_ph++; }
   return false;
@@ -365,7 +461,7 @@ bool stepFishSwim() {
 bool stepSiikaTriple() {
   if (g_i >= 6) return true;
   FastLED.clear();
-  if (!(g_i & 1)) drawCentered("SIIKA", TEXT_COLOR, fitScale("SIIKA"));
+  if (!(g_i & 1)) drawCentered("SIIKA", g_set.textColor, fitScale("SIIKA"));
   FastLED.show(); hold(250);
   g_i++;
   return false;
@@ -378,7 +474,7 @@ bool stepOtaSiikaPois() {
   if (g_i >= 6) return true;
   const char* words[] = {"OTA", "SIIKA", "POIS"};
   FastLED.clear();
-  drawCentered(words[g_i % 3], TEXT_COLOR, fitScale("SIIKA"));
+  drawCentered(words[g_i % 3], g_set.textColor, fitScale("SIIKA"));
   FastLED.show(); hold(500);
   g_i++;
   return false;
@@ -391,11 +487,11 @@ bool stepBigSiika() {
   FastLED.clear();
   if (g_ph == 0) {
     char one[2] = {letters[g_i], 0};
-    drawCentered(one, TEXT_COLOR, fitScale("A"));   // as big as the height allows
+    drawCentered(one, g_set.textColor, fitScale("A"));   // as big as the height allows
     FastLED.show(); hold(300);
     if (++g_i >= 5) { g_ph = 1; g_i = 0; }
   } else {
-    if (!(g_i & 1)) drawCentered("SIIKA", TEXT_COLOR, fitScale("SIIKA"));
+    if (!(g_i & 1)) drawCentered("SIIKA", g_set.textColor, fitScale("SIIKA"));
     FastLED.show(); hold(250);
     g_i++;
   }
@@ -406,7 +502,7 @@ bool stepBigSiika() {
 bool stepMilestone() {
   if (g_i >= 60) return true;
   FastLED.clear();
-  for (int i = 0; i < 12 * PANELS_X * PANELS_Y; i++)   // same density per panel
+  for (int i = 0; i < 12 * g_set.panelsX * g_set.panelsY; i++)   // same density per panel
     setPx(random(W), random(H), CHSV(random(256), 255, 255));
   FastLED.show(); hold(30);
   g_i++;
@@ -442,10 +538,6 @@ void beginNextDetectionAnim() {
 // g_pending one animation per catch.
 // ponytail: swap the mic sampling for digitalRead(TRIGGER_PIN) when the
 // listener board arrives (see voice-trigger.md) — this stays the only swap point.
-const int      LOUD_MIN_SAMPLES = 200;  // CALIBRATION KNOB — ~20 ms of sustained sound
-                                        // at ADC speed; spikes are a few samples
-const uint32_t QUIET_GAP_MS     = 1250; // CALIBRATION KNOB — silence required between
-                                        // two siikas; anything closer merges into one
 const uint8_t  PENDING_MAX      = 10;   // ponytail: queue cap so sustained noise can't
                                         // lock the panel into animations forever
 uint8_t  g_pending    = 0;              // detections waiting for their animation
@@ -465,10 +557,10 @@ void micSample() {
   int v = analogRead(MIC_PIN);
   g_micN++;
   if (v > g_micPeak) g_micPeak = v;
-  if (v >= LOUD_LEVEL) { if (g_loudScore < LOUD_MIN_SAMPLES) g_loudScore++; }
-  else                 { if (g_loudScore > 0)                g_loudScore--; }
-  if (g_loudScore >= LOUD_MIN_SAMPLES) {        // sustained loud right now
-    bool newSiika = millis() - g_lastLoudMs >= QUIET_GAP_MS;
+  if (v >= g_set.loudLevel) { if (g_loudScore < g_set.loudMinSamples) g_loudScore++; }
+  else                      { if (g_loudScore > 0)                    g_loudScore--; }
+  if (g_loudScore >= g_set.loudMinSamples) {    // sustained loud right now
+    bool newSiika = millis() - g_lastLoudMs >= g_set.quietGapMs;
     g_lastLoudMs = millis();
     if (newSiika) {
       if (g_pending < PENDING_MAX) g_pending++;
@@ -485,6 +577,148 @@ bool takeDetection() {
   if (!g_pending) return false;
   g_pending--;
   return true;
+}
+
+// ---- Web server: own FreeRTOS task on core 0 (plans/web-and-settings.md) ----
+// Built-in blocking WebServer — single connection is fine for a one-user LAN
+// admin UI. Real UI pages are phase 3; GET / is a status + OTA placeholder.
+WebServer server(80);
+bool g_otaAuthed = false;
+
+const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Siikapaneeli</title>
+<style>body{font-family:monospace;margin:2em;background:#08222a;color:#a0d2dc}</style>
+<h1>SIIKAPANEELI</h1>
+<pre id=s>...</pre>
+<button onclick="fetch('/api/trigger',{method:'POST'})">SIIKA!</button>
+<h2>OTA</h2>
+<form method=POST action=/update enctype=multipart/form-data>
+<input type=file name=update> <input type=submit value=Flash>
+</form>
+<script>
+async function poll(){s.textContent=JSON.stringify(await (await fetch('/api/status')).json(),null,1)}
+setInterval(poll,2000);poll()
+</script>
+)HTML";
+
+// Called at the top of every render pass: applies whatever the web task left
+// behind. Volatile peek first, so the mutex is only taken when there is work.
+void applyWebInput() {
+  if (!g_setPending && !g_webTrigger) return;
+  xSemaphoreTake(g_mux, portMAX_DELAY);
+  if (g_setPending) {
+    Settings s = g_pendingSet;
+    s.panelsX = g_set.panelsX;          // grid is fixed for this boot; the new
+    s.panelsY = g_set.panelsY;          // values wait in NVS for the next one
+    g_set = s;
+    g_setPending = false;
+    FastLED.setBrightness(g_set.brightness);
+  }
+  if (g_webTrigger) {
+    g_webTrigger = false;
+    if (g_pending < PENDING_MAX) g_pending++;
+  }
+  xSemaphoreGive(g_mux);
+}
+
+void handleStatus() {
+  JsonDocument d;
+  xSemaphoreTake(g_mux, portMAX_DELAY);
+  d["total"]    = g_total;
+  d["today"]    = g_today;
+  d["yest"]     = g_yest;
+  d["lastHour"] = lastHourCount();
+  d["mode"]     = g_mode == MODE_ANIM ? "anim" : "idle";
+  d["pending"]  = g_pending;
+  xSemaphoreGive(g_mux);
+  d["timeKnown"] = timeKnown();
+  d["uptimeS"]   = millis() / 1000;
+  d["heap"]      = ESP.getFreeHeap();
+  d["rssi"]      = WiFi.RSSI();
+  String out; serializeJson(d, out);
+  server.send(200, "application/json", out);
+}
+
+void handleGetSettings() {
+  xSemaphoreTake(g_mux, portMAX_DELAY);
+  Settings s = g_set;
+  xSemaphoreGive(g_mux);
+  String out; settingsJson(s, out);
+  server.send(200, "application/json", out);
+}
+
+void handlePostSettings() {
+  xSemaphoreTake(g_mux, portMAX_DELAY);
+  Settings s = g_set;
+  xSemaphoreGive(g_mux);
+  String err;
+  if (!settingsFromJson(server.arg("plain"), s, err)) {
+    server.send(400, "text/plain", err + "\n");
+    return;
+  }
+  saveSettings(s);                      // NVS write outside the mutex
+  xSemaphoreTake(g_mux, portMAX_DELAY);
+  bool reboot = s.panelsX != g_set.panelsX || s.panelsY != g_set.panelsY;
+  g_pendingSet = s;
+  g_setPending = true;
+  xSemaphoreGive(g_mux);
+  server.send(200, "application/json",
+              reboot ? "{\"ok\":true,\"rebootNeeded\":true}" : "{\"ok\":true}");
+}
+
+void handleTrigger() {
+  g_webTrigger = true;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// OTA upload (Update.h behind Basic auth). Render freezes via g_otaActive
+// during the flash write; success reboots into the new image.
+void handleUpdateUpload() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    g_otaAuthed = server.authenticate("siika", OTA_PASS);
+    if (!g_otaAuthed) return;
+    g_otaActive = true;
+    Serial.printf("OTA start: %s\n", up.filename.c_str());
+    Update.begin();
+  } else if (!g_otaAuthed) {
+    return;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    Update.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END) {
+    Update.end(true);
+    Serial.printf("OTA end: %u bytes, %s\n", up.totalSize,
+                  Update.hasError() ? Update.errorString() : "OK");
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    g_otaActive = false;
+  }
+}
+
+void handleUpdateDone() {
+  if (!g_otaAuthed) { g_otaActive = false; return server.requestAuthentication(); }
+  bool ok = !Update.hasError();
+  server.send(ok ? 200 : 500, "text/plain",
+              ok ? "OK, rebooting\n" : String(Update.errorString()) + "\n");
+  if (ok) { delay(500); ESP.restart(); }
+  g_otaActive = false;
+}
+
+void webTask(void *) {
+  for (;;) { server.handleClient(); delay(2); }
+}
+
+void setupWeb() {
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/api/status",   HTTP_GET,  handleStatus);
+  server.on("/api/settings", HTTP_GET,  handleGetSettings);
+  server.on("/api/settings", HTTP_POST, handlePostSettings);
+  server.on("/api/trigger",  HTTP_POST, handleTrigger);
+  server.on("/update",       HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.onNotFound([]() { server.send(404, "text/plain", "not found\n"); });
+  server.begin();
+  xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, nullptr, 0);
 }
 
 // ---- Self-check: the non-trivial counter logic, no NVS/time needed ----
@@ -514,10 +748,16 @@ void selfTest() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  g_mux = xSemaphoreCreateMutex();
+  loadCounters();                // opens prefs; settings share the namespace
+  loadSettings();
+  W = g_set.panelsX * PANEL_W;   // grid is fixed for this boot
+  H = g_set.panelsY * PANEL_H;
+  NUM_LEDS = W * H;
   Serial.printf("\nSiikapaneeli — %dx%d panels (%dx%d px), GPIO16, TEST_MODE=%d\n",
-                PANELS_X, PANELS_Y, W, H, TEST_MODE);
+                g_set.panelsX, g_set.panelsY, W, H, TEST_MODE);
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.setBrightness(g_set.brightness);
   // One panel group (3 panels) is fused at 5 A — the limiter must stay under
   // the fuse. Revisit for the 12-panel wall: 4 groups, 5 A fuse each, and a
   // global limiter can't enforce per-group caps (see multi-panel-power.md).
@@ -527,9 +767,9 @@ void setup() {
 
   selfTest();
   randomSeed(micros());
-  loadCounters();
 #if !TEST_MODE
-  setupTime();                   // test rig boots fast, no WiFi/NTP
+  setupWifi();                   // test rig boots fast, no WiFi/web
+  setupWeb();
 #endif
 
   Serial.printf("total=%lu today=%u yest=%u curDay=%ld timeKnown=%d\n",
@@ -547,6 +787,9 @@ void loop() {
   }
   if (g_anim()) { g_anim = nullptr; FastLED.clear(); FastLED.show(); hold(400); }
 #else
+  if (g_otaActive) { delay(10); return; }      // flash write in progress: frame
+                                               // freezes, mic pauses, no show()
+  applyWebInput();
   micSample();
   if (g_mode == MODE_IDLE && takeDetection()) {   // reacts within one pass
     recordDetection(nowEpoch());
