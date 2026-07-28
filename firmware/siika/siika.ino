@@ -27,6 +27,7 @@
 #include <time.h>
 #include <assert.h>
 #include "secrets.h"          // WIFI_SSID, WIFI_PASS, OTA_PASS
+#include "ui.h"               // INDEX_HTML (the whole web UI, PROGMEM)
 
 // Test rig switch: 1 = play every animation back-to-back forever, mic, WiFi
 // and web off. 0 = normal detection operation.
@@ -91,14 +92,23 @@ struct Settings {
 Settings g_set;
 int W, H, NUM_LEDS;    // derived from g_set in setup(); grid changes need a reboot
 
+// Render modes. ANIM is an overlay: a detection plays its animation in every
+// mode, then returns to the selected base mode (see plans/ui-features.md).
+enum Mode { MODE_IDLE, MODE_ANIM, MODE_DRAW, MODE_CLOCK };
+
 // Web -> render crossing (architecture.md rule: the web task never touches
 // leds[] or FastLED). The render loop applies these between frames in
 // applyWebInput(); status reads snapshot the counters under the same mutex.
 SemaphoreHandle_t g_mux;
 Settings g_pendingSet;
-volatile bool g_setPending = false;   // g_pendingSet waits to be applied
-volatile bool g_webTrigger = false;   // POST /api/trigger: fake one siika
-volatile bool g_otaActive  = false;   // flash write in progress: render freezes
+volatile bool g_setPending  = false;  // g_pendingSet waits to be applied
+volatile bool g_webTrigger  = false;  // POST /api/trigger: fake one siika
+volatile bool g_otaActive   = false;  // flash write in progress: render freezes
+volatile bool g_modePending = false;  // g_pendingMode waits to be applied
+volatile Mode g_pendingMode = MODE_IDLE;
+volatile bool g_drawPending = false;  // g_drawBuf holds a fresh frame
+uint8_t g_drawBuf[MAX_LEDS * 3];      // browser frame, row-major logical RGB;
+                                      // written by web, read by render, under g_mux
 
 struct Glyph { char ch; uint8_t w; uint8_t rows[5]; };
 
@@ -156,6 +166,7 @@ const Glyph FONT[] = {
   {'8', 3, {0b111, 0b101, 0b111, 0b101, 0b111}},
   {'9', 3, {0b111, 0b101, 0b111, 0b001, 0b111}},
   {'-', 3, {0b000, 0b000, 0b111, 0b000, 0b000}},
+  {':', 1, {0b0,   0b1,   0b0,   0b1,   0b0  }},   // clock mode
   {' ', 2, {0,     0,     0,     0,     0    }},
 };
 const int FONT_LEN = sizeof(FONT) / sizeof(FONT[0]);
@@ -402,8 +413,9 @@ void recordDetection(uint32_t t) {
 // Every renderer is a step function: called when its hold expires, draws the
 // next frame, holds it, returns true when finished. loop() samples the mic
 // between frames.
-enum Mode { MODE_IDLE, MODE_ANIM };    // DRAW, CLOCK arrive with the web UI
 Mode g_mode = MODE_IDLE;
+volatile Mode g_baseMode = MODE_IDLE;  // where ANIM returns; volatile: web reads it
+bool g_drawNew = false;                // render-local: draw buffer needs repainting
 uint32_t g_holdUntil = 0;              // current frame stays up until this millis()
 int g_ph = 0, g_i = 0;                 // per-animation phase/step, reset by beginAnim
 
@@ -438,6 +450,53 @@ void stepIdle() {
   }
   hold(g_set.statMs);
   g_idlePage = (g_idlePage + 1) % 4;
+}
+
+// Draw: show the last browser-posted frame; repaint only when a new one
+// arrived (or the mode was re-entered). The buffer survives detection
+// animations, so the drawing comes back after them.
+void stepDraw() {
+  if (!g_drawNew) { hold(50); return; }
+  g_drawNew = false;
+  xSemaphoreTake(g_mux, portMAX_DELAY);   // web may be writing the next frame
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++) {
+      const uint8_t *p = &g_drawBuf[(y * W + x) * 3];
+      leds[XY(x, y)] = CRGB(p[0], p[1], p[2]);
+    }
+  xSemaphoreGive(g_mux);
+  FastLED.show();
+  hold(50);
+}
+
+// Clock: HH:MM centered, colon blinking at 1 Hz, "--:--" until NTP lands.
+// Fixed layout so the blink can't shift the digits: every digit (and '-')
+// is 3 px wide, ':' is 1 px, gaps 1 px -> offsets HH=0, colon=8, MM=10,
+// total 17 px per scale unit.
+void stepClock() {
+  char hh[3] = "--", mm[3] = "--";
+  if (timeKnown()) {
+    time_t tt = time(nullptr); struct tm lt; localtime_r(&tt, &lt);
+    snprintf(hh, 3, "%02d", lt.tm_hour);
+    snprintf(mm, 3, "%02d", lt.tm_min);
+  }
+  int sc = fitScale("00:00");
+  int x = (W - 17 * sc) / 2;
+  int y = (H - FONT_H * sc) / 2;
+  FastLED.clear();
+  drawText(x, y, hh, g_set.textColor, sc);
+  if ((millis() / 500) & 1) drawChar(x + 8 * sc, y, ':', g_set.textColor, sc);
+  drawText(x + 10 * sc, y, mm, g_set.textColor, sc);
+  FastLED.show();
+  hold(500);
+}
+
+// Switch the visible renderer; every mode restarts cleanly.
+void enterMode(Mode m) {
+  g_mode = m;
+  g_holdUntil = 0;
+  g_idlePage = 0;
+  g_drawNew = true;      // draw repaints its buffer when (re-)entered
 }
 
 // ---- Detection animations (single-panel prototype content) ----
@@ -567,7 +626,7 @@ void micSample() {
       Serial.printf("mic TRIGGER peak=%d pending=%u\n", g_micPeak, g_pending);
     }
   }
-  if (g_mode == MODE_IDLE && millis() - g_micPrintMs >= 2000) {
+  if (g_mode != MODE_ANIM && millis() - g_micPrintMs >= 2000) {
     Serial.printf("mic peak=%d n=%lu\n", g_micPeak, (unsigned long)g_micN);
     g_micPrintMs = millis(); g_micPeak = 0; g_micN = 0;
   }
@@ -581,31 +640,14 @@ bool takeDetection() {
 
 // ---- Web server: own FreeRTOS task on core 0 (plans/web-and-settings.md) ----
 // Built-in blocking WebServer — single connection is fine for a one-user LAN
-// admin UI. Real UI pages are phase 3; GET / is a status + OTA placeholder.
+// admin UI. The UI itself lives in ui.h (single PROGMEM index.html).
 WebServer server(80);
 bool g_otaAuthed = false;
-
-const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
-<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Siikapaneeli</title>
-<style>body{font-family:monospace;margin:2em;background:#08222a;color:#a0d2dc}</style>
-<h1>SIIKAPANEELI</h1>
-<pre id=s>...</pre>
-<button onclick="fetch('/api/trigger',{method:'POST'})">SIIKA!</button>
-<h2>OTA</h2>
-<form method=POST action=/update enctype=multipart/form-data>
-<input type=file name=update> <input type=submit value=Flash>
-</form>
-<script>
-async function poll(){s.textContent=JSON.stringify(await (await fetch('/api/status')).json(),null,1)}
-setInterval(poll,2000);poll()
-</script>
-)HTML";
 
 // Called at the top of every render pass: applies whatever the web task left
 // behind. Volatile peek first, so the mutex is only taken when there is work.
 void applyWebInput() {
-  if (!g_setPending && !g_webTrigger) return;
+  if (!g_setPending && !g_webTrigger && !g_modePending && !g_drawPending) return;
   xSemaphoreTake(g_mux, portMAX_DELAY);
   if (g_setPending) {
     Settings s = g_pendingSet;
@@ -619,7 +661,25 @@ void applyWebInput() {
     g_webTrigger = false;
     if (g_pending < PENDING_MAX) g_pending++;
   }
+  if (g_modePending) {
+    g_modePending = false;
+    g_baseMode = g_pendingMode;
+    if (g_mode != MODE_ANIM) enterMode(g_baseMode);   // anim finishes, then returns
+  }
+  if (g_drawPending) {
+    g_drawPending = false;
+    g_drawNew = true;
+  }
   xSemaphoreGive(g_mux);
+}
+
+const char* modeName(Mode m) {
+  switch (m) {
+    case MODE_ANIM:  return "anim";
+    case MODE_DRAW:  return "draw";
+    case MODE_CLOCK: return "clock";
+    default:         return "idle";
+  }
 }
 
 void handleStatus() {
@@ -629,7 +689,8 @@ void handleStatus() {
   d["today"]    = g_today;
   d["yest"]     = g_yest;
   d["lastHour"] = lastHourCount();
-  d["mode"]     = g_mode == MODE_ANIM ? "anim" : "idle";
+  d["mode"]     = modeName(g_mode);
+  d["baseMode"] = modeName(g_baseMode);
   d["pending"]  = g_pending;
   xSemaphoreGive(g_mux);
   d["timeKnown"] = timeKnown();
@@ -669,6 +730,40 @@ void handlePostSettings() {
 
 void handleTrigger() {
   g_webTrigger = true;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleMode() {
+  JsonDocument d;
+  if (deserializeJson(d, server.arg("plain"))) { server.send(400, "text/plain", "bad json\n"); return; }
+  const char *m = d["mode"] | "";
+  Mode nm;
+  if      (!strcmp(m, "idle"))  nm = MODE_IDLE;
+  else if (!strcmp(m, "draw"))  nm = MODE_DRAW;
+  else if (!strcmp(m, "clock")) nm = MODE_CLOCK;
+  else { server.send(400, "text/plain", "mode: idle|draw|clock\n"); return; }
+  g_pendingMode = nm;
+  g_modePending = true;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// Body: W*H pixels as RRGGBB hex, row-major logical (x,y). Hex, not raw
+// binary: WebServer's arg("plain") truncates at the first 0x00 byte.
+void handleDraw() {
+  const String &body = server.arg("plain");
+  int need = NUM_LEDS * 6;
+  if ((int)body.length() != need) {
+    server.send(400, "text/plain", String("want ") + need + " hex chars\n");
+    return;
+  }
+  xSemaphoreTake(g_mux, portMAX_DELAY);
+  for (int i = 0; i < NUM_LEDS * 3; i++) {
+    char h[3] = {body[i * 2], body[i * 2 + 1], 0};
+    g_drawBuf[i] = strtoul(h, nullptr, 16);
+  }
+  g_drawPending = true;
+  xSemaphoreGive(g_mux);
+  if (g_baseMode != MODE_DRAW) { g_pendingMode = MODE_DRAW; g_modePending = true; }
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -715,6 +810,8 @@ void setupWeb() {
   server.on("/api/settings", HTTP_GET,  handleGetSettings);
   server.on("/api/settings", HTTP_POST, handlePostSettings);
   server.on("/api/trigger",  HTTP_POST, handleTrigger);
+  server.on("/api/mode",     HTTP_POST, handleMode);
+  server.on("/api/draw",     HTTP_POST, handleDraw);
   server.on("/update",       HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.onNotFound([]() { server.send(404, "text/plain", "not found\n"); });
   server.begin();
@@ -791,7 +888,7 @@ void loop() {
                                                // freezes, mic pauses, no show()
   applyWebInput();
   micSample();
-  if (g_mode == MODE_IDLE && takeDetection()) {   // reacts within one pass
+  if (g_mode != MODE_ANIM && takeDetection()) {   // any base mode; reacts within one pass
     recordDetection(nowEpoch());
     beginNextDetectionAnim();
     g_mode = MODE_ANIM;
@@ -804,9 +901,13 @@ void loop() {
         recordDetection(nowEpoch());
         beginNextDetectionAnim();
       } else {
-        g_mode = MODE_IDLE; g_idlePage = 0;
+        enterMode(g_baseMode);                 // back to whatever the wall was showing
       }
     }
+  } else if (g_mode == MODE_DRAW) {
+    stepDraw();
+  } else if (g_mode == MODE_CLOCK) {
+    stepClock();
   } else {
     stepIdle();
   }
